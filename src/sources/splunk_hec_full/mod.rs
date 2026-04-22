@@ -184,6 +184,16 @@ pub struct SplunkHecFullConfig {
     /// When false, events without a channel will have an auto-generated channel ID.
     #[serde(default = "default_true")]
     raw_require_channel: bool,
+
+    /// Whether to split raw endpoint body by newlines into multiple events.
+    ///
+    /// When enabled, raw endpoint requests with multiline bodies are split
+    /// by newline characters (`\n`) into separate events, matching Splunk's
+    /// LINE_BREAKER behavior. Empty lines are skipped.
+    ///
+    /// When disabled (default), the entire raw body is treated as a single event.
+    #[serde(default)]
+    raw_line_splitting: bool,
 }
 
 const fn default_true() -> bool {
@@ -209,6 +219,7 @@ impl Default for SplunkHecFullConfig {
             auto_forward_metadata: true,
             fix_bare_string_events: true,
             raw_require_channel: true,
+            raw_line_splitting: false,
         }
     }
 }
@@ -425,6 +436,7 @@ struct SplunkSource {
     auto_forward_metadata: bool,
     fix_bare_string_events: bool,
     raw_require_channel: bool,
+    raw_line_splitting: bool,
 }
 
 impl SplunkSource {
@@ -470,6 +482,7 @@ impl SplunkSource {
             auto_forward_metadata: config.auto_forward_metadata,
             fix_bare_string_events: config.fix_bare_string_events,
             raw_require_channel: config.raw_require_channel,
+            raw_line_splitting: config.raw_line_splitting,
         })
     }
 
@@ -627,6 +640,7 @@ impl SplunkSource {
         let auto_forward_metadata = self.auto_forward_metadata;
         let fix_bare_string_events = self.fix_bare_string_events;
         let raw_require_channel = self.raw_require_channel;
+        let raw_line_splitting = self.raw_line_splitting;
 
         warp::post()
             .and(path!("raw" / "1.0").or(path!("raw")))
@@ -693,23 +707,35 @@ impl SplunkSource {
                             .as_deref()
                             .and_then(|t| token_binding_engine.resolve(t));
 
-                        // Build raw event with metadata from query params and token binding
-                        let mut event = raw_event(
-                            body,
-                            gzip,
-                            channel_id,
-                            remote,
-                            xff,
-                            batch,
-                            log_namespace,
-                            &events_received,
-                            fix_bare_string_events,
-                        )?;
+                        // Build raw event(s)
+                        // When raw_line_splitting is enabled, split body by newlines into multiple events
+                        let mut events = if raw_line_splitting {
+                            raw_events_split(
+                                body,
+                                gzip,
+                                channel_id,
+                                remote,
+                                xff,
+                                batch,
+                                log_namespace,
+                                &events_received,
+                                fix_bare_string_events,
+                            )?
+                        } else {
+                            vec![raw_event(
+                                body,
+                                gzip,
+                                channel_id,
+                                remote,
+                                xff,
+                                batch,
+                                log_namespace,
+                                &events_received,
+                                fix_bare_string_events,
+                            )?]
+                        };
 
-                        // Apply metadata from URL query params (higher priority than token binding)
-                        let log = event.as_mut_log();
-
-                        // Determine final metadata values:
+                        // Compute final metadata values (shared across all events):
                         // Priority: URL query params > token binding defaults
                         let final_host = query_params.host;
                         let final_index = query_params
@@ -722,92 +748,104 @@ impl SplunkSource {
                             .source
                             .or_else(|| binding.and_then(|b| b.source.clone()));
 
-                        if let Some(host_val) = final_host {
-                            log_namespace.insert_source_metadata(
-                                SplunkHecFullConfig::NAME,
-                                log,
-                                log_schema().host_key().map(LegacyKey::InsertIfEmpty),
-                                lookup::path!("host"),
-                                host_val.clone(),
-                            );
-                            if auto_forward_metadata {
-                                log.insert(event_path!("host"), Value::from(host_val));
-                            }
-                        }
-
-                        if let Some(index_val) = final_index {
-                            log_namespace.insert_source_metadata(
-                                SplunkHecFullConfig::NAME,
-                                log,
-                                Some(LegacyKey::Overwrite(&owned_value_path!(INDEX))),
-                                lookup::path!("index"),
-                                index_val.clone(),
-                            );
-                            if auto_forward_metadata {
-                                log.insert(event_path!("index"), Value::from(index_val));
-                            }
-                        }
-
-                        if let Some(sourcetype_val) = final_sourcetype {
-                            log_namespace.insert_source_metadata(
-                                SplunkHecFullConfig::NAME,
-                                log,
-                                Some(LegacyKey::Overwrite(&owned_value_path!(SOURCETYPE))),
-                                lookup::path!("sourcetype"),
-                                sourcetype_val.clone(),
-                            );
-                            if auto_forward_metadata {
-                                log.insert(event_path!("sourcetype"), Value::from(sourcetype_val));
-                            }
-                        }
-
-                        if let Some(source_val) = final_source {
-                            log_namespace.insert_source_metadata(
-                                SplunkHecFullConfig::NAME,
-                                log,
-                                Some(LegacyKey::Overwrite(&owned_value_path!(SOURCE))),
-                                lookup::path!("source"),
-                                source_val.clone(),
-                            );
-                            if auto_forward_metadata {
-                                log.insert(event_path!("source"), Value::from(source_val));
-                            }
-                        }
-
-                        if let Some(token) = token.filter(|_| store_hec_token) {
-                            event.metadata_mut().set_splunk_hec_token(token.into());
-                        }
-
-                        // Apply time from URL query params (?time=epoch)
-                        if let Some(time_str) = query_params.time {
+                        // Apply metadata + token + time to each event
+                        for event in events.iter_mut() {
                             let log = event.as_mut_log();
-                            if let Ok(time_f64) = time_str.parse::<f64>() {
-                                let secs = time_f64.floor() as i64;
-                                let nsecs = ((time_f64.fract()) * 1_000_000_000.0) as u32;
-                                if let Some(timestamp) = Utc.timestamp_opt(secs, nsecs).single() {
-                                    log_namespace.insert_source_metadata(
-                                        SplunkHecFullConfig::NAME,
-                                        log,
-                                        log_schema().timestamp_key().map(LegacyKey::Overwrite),
-                                        lookup::path!("timestamp"),
-                                        timestamp,
-                                    );
+
+                            if let Some(ref host_val) = final_host {
+                                log_namespace.insert_source_metadata(
+                                    SplunkHecFullConfig::NAME,
+                                    log,
+                                    log_schema().host_key().map(LegacyKey::InsertIfEmpty),
+                                    lookup::path!("host"),
+                                    host_val.clone(),
+                                );
+                                if auto_forward_metadata {
+                                    log.insert(event_path!("host"), Value::from(host_val.clone()));
                                 }
-                            } else if let Ok(time_i64) = time_str.parse::<i64>()
-                                && let Some(timestamp) = parse_timestamp(time_i64) {
-                                    log_namespace.insert_source_metadata(
-                                        SplunkHecFullConfig::NAME,
-                                        log,
-                                        log_schema().timestamp_key().map(LegacyKey::Overwrite),
-                                        lookup::path!("timestamp"),
-                                        timestamp,
-                                    );
+                            }
+
+                            if let Some(ref index_val) = final_index {
+                                log_namespace.insert_source_metadata(
+                                    SplunkHecFullConfig::NAME,
+                                    log,
+                                    Some(LegacyKey::Overwrite(&owned_value_path!(INDEX))),
+                                    lookup::path!("index"),
+                                    index_val.clone(),
+                                );
+                                if auto_forward_metadata {
+                                    log.insert(event_path!("index"), Value::from(index_val.clone()));
+                                }
+                            }
+
+                            if let Some(ref sourcetype_val) = final_sourcetype {
+                                log_namespace.insert_source_metadata(
+                                    SplunkHecFullConfig::NAME,
+                                    log,
+                                    Some(LegacyKey::Overwrite(&owned_value_path!(SOURCETYPE))),
+                                    lookup::path!("sourcetype"),
+                                    sourcetype_val.clone(),
+                                );
+                                if auto_forward_metadata {
+                                    log.insert(event_path!("sourcetype"), Value::from(sourcetype_val.clone()));
+                                }
+                            }
+
+                            if let Some(ref source_val) = final_source {
+                                log_namespace.insert_source_metadata(
+                                    SplunkHecFullConfig::NAME,
+                                    log,
+                                    Some(LegacyKey::Overwrite(&owned_value_path!(SOURCE))),
+                                    lookup::path!("source"),
+                                    source_val.clone(),
+                                );
+                                if auto_forward_metadata {
+                                    log.insert(event_path!("source"), Value::from(source_val.clone()));
+                                }
+                            }
+
+                            if let Some(ref token_str) = token {
+                                if store_hec_token {
+                                    event.metadata_mut().set_splunk_hec_token(token_str.clone().into());
+                                }
+                            }
+
+                            // Apply time from URL query params (?time=epoch)
+                            if let Some(ref time_str) = query_params.time {
+                                let log = event.as_mut_log();
+                                if let Ok(time_f64) = time_str.parse::<f64>() {
+                                    let secs = time_f64.floor() as i64;
+                                    let nsecs = ((time_f64.fract()) * 1_000_000_000.0) as u32;
+                                    if let Some(timestamp) = Utc.timestamp_opt(secs, nsecs).single() {
+                                        log_namespace.insert_source_metadata(
+                                            SplunkHecFullConfig::NAME,
+                                            log,
+                                            log_schema().timestamp_key().map(LegacyKey::Overwrite),
+                                            lookup::path!("timestamp"),
+                                            timestamp,
+                                        );
+                                    }
+                                } else if let Ok(time_i64) = time_str.parse::<i64>()
+                                    && let Some(timestamp) = parse_timestamp(time_i64) {
+                                        log_namespace.insert_source_metadata(
+                                            SplunkHecFullConfig::NAME,
+                                            log,
+                                            log_schema().timestamp_key().map(LegacyKey::Overwrite),
+                                            lookup::path!("timestamp"),
+                                            timestamp,
+                                        );
+                                }
                             }
                         }
 
-                        let res = out.send_event(event).await;
-                        res.map(|_| maybe_ack_id)
-                            .map_err(|_| Rejection::from(ApiError::ServerShutdown))
+                        let res = out.send_batch(events).await;
+                        match res {
+                            Ok(()) => Ok(maybe_ack_id),
+                            Err(SendError::Closed) => Err(Rejection::from(ApiError::ServerShutdown)),
+                            Err(SendError::Timeout) => {
+                                unreachable!("No timeout is configured for this source.")
+                            }
+                        }
                     }
                 },
             )
@@ -1722,6 +1760,127 @@ fn raw_event(
     Ok(Event::from(log))
 }
 
+/// Creates multiple events from raw request by splitting on newlines.
+/// Each non-empty line becomes a separate event, matching Splunk's LINE_BREAKER behavior.
+#[allow(clippy::too_many_arguments)]
+fn raw_events_split(
+    bytes: Bytes,
+    gzip: bool,
+    channel: String,
+    remote: Option<SocketAddr>,
+    xff: Option<String>,
+    batch: Option<BatchNotifier>,
+    log_namespace: LogNamespace,
+    events_received: &Registered<EventsReceived>,
+    fix_bare_string_events: bool,
+) -> Result<Vec<Event>, Rejection> {
+    // Decompress if needed
+    let raw_bytes: Bytes = if gzip {
+        let mut data = Vec::new();
+        match MultiGzDecoder::new(bytes.reader()).read_to_end(&mut data) {
+            Ok(0) => return Err(ApiError::NoData.into()),
+            Ok(_) => Bytes::from(data),
+            Err(error) => {
+                emit!(SplunkHecRequestBodyInvalidError { error });
+                return Err(ApiError::InvalidDataFormat { event: 0 }.into());
+            }
+        }
+    } else {
+        if bytes.is_empty() {
+            return Err(ApiError::NoData.into());
+        }
+        bytes
+    };
+
+    // Split by newlines, filter empty lines
+    let text = String::from_utf8_lossy(&raw_bytes);
+    let lines: Vec<&str> = text.split('\n').filter(|l| !l.trim().is_empty()).collect();
+
+    if lines.is_empty() {
+        return Err(ApiError::NoData.into());
+    }
+
+    // If only one line, delegate to raw_event for efficiency
+    if lines.len() == 1 {
+        let event = raw_event(
+            raw_bytes,
+            false, // already decompressed
+            channel,
+            remote,
+            xff,
+            batch,
+            log_namespace,
+            events_received,
+            fix_bare_string_events,
+        )?;
+        return Ok(vec![event]);
+    }
+
+    // Build an event per line
+    let host = if let Some(ref remote_address) = xff {
+        Some(remote_address.clone())
+    } else {
+        remote.map(|r| r.to_string())
+    };
+
+    let mut events = Vec::with_capacity(lines.len());
+    for line in lines {
+        let message: Value = Value::from(Bytes::from(line.to_owned()));
+
+        let mut log = match log_namespace {
+            LogNamespace::Vector => {
+                if fix_bare_string_events && message.is_bytes() {
+                    let mut l = LogEvent::default();
+                    l.insert(event_path!("message"), message);
+                    l
+                } else {
+                    LogEvent::from(message)
+                }
+            }
+            LogNamespace::Legacy => {
+                let mut l = LogEvent::default();
+                l.maybe_insert(log_schema().message_key_target_path(), message);
+                l
+            }
+        };
+
+        events_received.emit(CountByteSize(1, log.estimated_json_encoded_size_of()));
+
+        // Add channel (same for all lines in this request)
+        log_namespace.insert_source_metadata(
+            SplunkHecFullConfig::NAME,
+            &mut log,
+            Some(LegacyKey::Overwrite(&owned_value_path!(CHANNEL))),
+            lookup::path!(CHANNEL),
+            channel.clone(),
+        );
+
+        if let Some(ref host) = host {
+            log_namespace.insert_source_metadata(
+                SplunkHecFullConfig::NAME,
+                &mut log,
+                log_schema().host_key().map(LegacyKey::InsertIfEmpty),
+                lookup::path!("host"),
+                host.clone(),
+            );
+        }
+
+        log_namespace.insert_standard_vector_source_metadata(
+            &mut log,
+            SplunkHecFullConfig::NAME,
+            Utc::now(),
+        );
+
+        if let Some(ref batch) = batch {
+            log = log.with_batch_notifier(batch);
+        }
+
+        events.push(Event::from(log));
+    }
+
+    Ok(events)
+}
+
 // === Internal Events (inline to avoid coupling with splunk_hec's internal_events) ===
 
 #[derive(Debug, vector_lib::NamedInternalEvent)]
@@ -2030,6 +2189,31 @@ mod tests {
         SocketAddr,
         PortGuard,
     ) {
+        source_with_full_opts(
+            token,
+            valid_tokens,
+            acknowledgements,
+            store_hec_token,
+            token_bindings,
+            raw_require_channel,
+            false, // raw_line_splitting default off
+        )
+        .await
+    }
+
+    async fn source_with_full_opts(
+        token: Option<SensitiveString>,
+        valid_tokens: Option<&[&str]>,
+        acknowledgements: Option<HecAcknowledgementsConfig>,
+        store_hec_token: bool,
+        token_bindings: HashMap<String, TokenBindingConfig>,
+        raw_require_channel: bool,
+        raw_line_splitting: bool,
+    ) -> (
+        impl Stream<Item = Event> + Unpin + use<>,
+        SocketAddr,
+        PortGuard,
+    ) {
         let (sender, recv) = SourceSender::new_test_finalize(EventStatus::Delivered);
         let (_guard, address) = next_addr();
         let valid_tokens =
@@ -2051,6 +2235,7 @@ mod tests {
                 auto_forward_metadata: true,
                 fix_bare_string_events: true,
                 raw_require_channel,
+                raw_line_splitting,
             }
             .build(cx)
             .await
@@ -3071,5 +3256,122 @@ mod tests {
         assert_eq!(events[3].as_log().get("k").unwrap().to_string_lossy(), "v");
         // Array -> message
         assert!(events[4].as_log().get("message").unwrap().is_array());
+    }
+
+    // Test: Raw line splitting splits multiline body into separate events
+    #[tokio::test]
+    async fn test_raw_line_splitting() {
+        let (source, address, _guard) = source_with_full_opts(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            HashMap::new(),
+            false, // raw_require_channel
+            true,  // raw_line_splitting
+        )
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector/raw?channel=ch1"))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .body("line_one\nline_two\nline_three")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let events = collect_n(source, 3).await;
+        assert_eq!(events.len(), 3, "Multiline raw body should produce 3 events");
+
+        assert_eq!(
+            events[0].as_log().get("message").unwrap().to_string_lossy(),
+            "line_one"
+        );
+        assert_eq!(
+            events[1].as_log().get("message").unwrap().to_string_lossy(),
+            "line_two"
+        );
+        assert_eq!(
+            events[2].as_log().get("message").unwrap().to_string_lossy(),
+            "line_three"
+        );
+    }
+
+    // Test: Raw line splitting with URL metadata applies to all lines
+    #[tokio::test]
+    async fn test_raw_line_splitting_with_metadata() {
+        let (source, address, _guard) = source_with_full_opts(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            HashMap::new(),
+            false,
+            true, // raw_line_splitting
+        )
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://{address}/services/collector/raw?channel=ch1&index=split_idx&sourcetype=split_type"
+            ))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .body("alpha\nbeta")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let events = collect_n(source, 2).await;
+        assert_eq!(events.len(), 2);
+
+        // Both events should have the URL metadata applied
+        for (i, event) in events.iter().enumerate() {
+            let log = event.as_log();
+            assert_eq!(
+                log.get("index").unwrap().to_string_lossy(),
+                "split_idx",
+                "Event {i} should have index metadata"
+            );
+            assert_eq!(
+                log.get("sourcetype").unwrap().to_string_lossy(),
+                "split_type",
+                "Event {i} should have sourcetype metadata"
+            );
+        }
+        assert_eq!(events[0].as_log().get("message").unwrap().to_string_lossy(), "alpha");
+        assert_eq!(events[1].as_log().get("message").unwrap().to_string_lossy(), "beta");
+    }
+
+    // Test: Raw line splitting disabled (default) keeps single event
+    #[tokio::test]
+    async fn test_raw_line_splitting_disabled() {
+        let (source, address, _guard) = source_with_full_opts(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            HashMap::new(),
+            false,
+            false, // raw_line_splitting OFF
+        )
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector/raw?channel=ch1"))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .body("line_A\nline_B\nline_C")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let events = collect_n(source, 1).await;
+        assert_eq!(events.len(), 1, "With splitting disabled, should be 1 event");
+        // The single event should contain all lines
+        let msg = events[0].as_log().get("message").unwrap().to_string_lossy();
+        assert!(msg.contains("line_A"), "Single event should contain all text");
+        assert!(msg.contains("line_C"));
     }
 }
