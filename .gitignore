@@ -64,3 +64,9 @@ volumes/
 
 # LLM tools
 copilot-instructions.md
+
+# local files not checked in
+local/
+
+# vscode
+.vscode/
