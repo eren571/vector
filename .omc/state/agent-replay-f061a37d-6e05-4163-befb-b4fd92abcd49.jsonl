@@ -1,0 +1,7 @@
+{"t":0,"agent":"a3838f4","agent_type":"Bash","event":"agent_stop","success":true,"duration_ms":12593}
+{"t":0,"agent":"a5fb3e7","agent_type":"Explore","event":"agent_start","parent_mode":"none"}
+{"t":0,"agent":"a061a20","agent_type":"Explore","event":"agent_stop","success":true,"duration_ms":17984}
+{"t":0,"agent":"a284600","agent_type":"Plan","event":"agent_stop","success":true,"duration_ms":27614}
+{"t":0,"agent":"a5fb3e7","agent_type":"Explore","event":"agent_stop","success":true,"duration_ms":103501}
+{"t":0,"agent":"a2c1bfd","agent_type":"Explore","event":"agent_start","parent_mode":"none"}
+{"t":0,"agent":"a2c1bfd","agent_type":"Explore","event":"agent_stop","success":true,"duration_ms":67296}

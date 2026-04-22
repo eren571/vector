@@ -1,0 +1,368 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1776841250257,
+  "projectRoot": "/Users/erenyong/Desktop/code/vector",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Rust",
+        "version": "1.88",
+        "confidence": "high",
+        "markers": [
+          "Cargo.toml"
+        ]
+      },
+      {
+        "name": "C/C++",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "Makefile"
+        ]
+      }
+    ],
+    "frameworks": [
+      {
+        "name": "axum",
+        "version": null,
+        "category": "backend"
+      }
+    ],
+    "packageManager": "cargo",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": "cargo build",
+    "testCommand": "cargo test",
+    "lintCommand": "cargo clippy",
+    "devCommand": "cargo run",
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": "type-based"
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "docs",
+      "lib",
+      "scripts",
+      "src",
+      "tests"
+    ],
+    "gitBranches": {
+      "defaultBranch": "master",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "benches": {
+      "path": "benches",
+      "purpose": null,
+      "fileCount": 13,
+      "lastAccessed": 1776841250227,
+      "keyFiles": [
+        "batch.rs",
+        "default.rs",
+        "distribution_statistic.rs",
+        "enrichment_tables.rs",
+        "event.rs"
+      ]
+    },
+    "changelog.d": {
+      "path": "changelog.d",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1776841250228,
+      "keyFiles": [
+        "README.md"
+      ]
+    },
+    "config": {
+      "path": "config",
+      "purpose": "Configuration files",
+      "fileCount": 2,
+      "lastAccessed": 1776841250228,
+      "keyFiles": [
+        "README.md",
+        "vector.yaml"
+      ]
+    },
+    "distribution": {
+      "path": "distribution",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1776841250228,
+      "keyFiles": [
+        "install.sh"
+      ]
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 9,
+      "lastAccessed": 1776841250229,
+      "keyFiles": [
+        "ARCHITECTURE.md",
+        "DEPRECATION.md",
+        "DEPRECATIONS.md",
+        "DEVELOPING.md",
+        "DOCUMENTING.md"
+      ]
+    },
+    "lib": {
+      "path": "lib",
+      "purpose": "Library code",
+      "fileCount": 0,
+      "lastAccessed": 1776841250229,
+      "keyFiles": []
+    },
+    "licenses": {
+      "path": "licenses",
+      "purpose": null,
+      "fileCount": 15,
+      "lastAccessed": 1776841250229,
+      "keyFiles": [
+        "0BSD",
+        "Apache-2.0",
+        "BSD-2-Clause",
+        "BSD-3-Clause",
+        "BSL-1.0"
+      ]
+    },
+    "proto": {
+      "path": "proto",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1776841250230,
+      "keyFiles": []
+    },
+    "regression": {
+      "path": "regression",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1776841250230,
+      "keyFiles": [
+        "Dockerfile",
+        "config.yaml"
+      ]
+    },
+    "rfcs": {
+      "path": "rfcs",
+      "purpose": null,
+      "fileCount": 74,
+      "lastAccessed": 1776841250230,
+      "keyFiles": [
+        "2020-03-06-1999-api-extensions-for-lua-transform.md",
+        "2020-03-17-2064-event-driven-observability.md",
+        "2020-04-04-2221-kubernetes-integration.md",
+        "2020-04-06-1858-automatically-adjust-request-limits.md",
+        "2020-04-15-2341-wasm-plugins.md"
+      ]
+    },
+    "rust-doc": {
+      "path": "rust-doc",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1776841250231,
+      "keyFiles": [
+        "Makefile"
+      ]
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 38,
+      "lastAccessed": 1776841250231,
+      "keyFiles": [
+        "Gemfile",
+        "Gemfile.lock",
+        "README.md",
+        "build-docker.sh",
+        "build.sh"
+      ]
+    },
+    "src": {
+      "path": "src",
+      "purpose": "Source code",
+      "fileCount": 35,
+      "lastAccessed": 1776841250231,
+      "keyFiles": [
+        "amqp.rs",
+        "app.rs",
+        "async_read.rs",
+        "cli.rs",
+        "completion.rs"
+      ]
+    },
+    "target": {
+      "path": "target",
+      "purpose": null,
+      "fileCount": 3,
+      "lastAccessed": 1776841250232,
+      "keyFiles": [
+        "CACHEDIR.TAG"
+      ]
+    },
+    "testing": {
+      "path": "testing",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1776841250233,
+      "keyFiles": []
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 0,
+      "lastAccessed": 1776841250233,
+      "keyFiles": []
+    },
+    "tilt": {
+      "path": "tilt",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1776841250233,
+      "keyFiles": [
+        "Dockerfile"
+      ]
+    },
+    "vdev": {
+      "path": "vdev",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1776841250233,
+      "keyFiles": [
+        "Cargo.toml",
+        "README.md"
+      ]
+    },
+    "website": {
+      "path": "website",
+      "purpose": null,
+      "fileCount": 18,
+      "lastAccessed": 1776841250234,
+      "keyFiles": [
+        "Makefile",
+        "README.md",
+        "algolia.json",
+        "babel.config.js",
+        "config.toml"
+      ]
+    },
+    "config/examples": {
+      "path": "config/examples",
+      "purpose": "Example code",
+      "fileCount": 9,
+      "lastAccessed": 1776841250234,
+      "keyFiles": [
+        "docs_example.yaml",
+        "environment_variables.yaml",
+        "es_s3_hybrid.yaml"
+      ]
+    },
+    "src/api": {
+      "path": "src/api",
+      "purpose": "API routes",
+      "fileCount": 4,
+      "lastAccessed": 1776841250237,
+      "keyFiles": [
+        "handler.rs",
+        "mod.rs",
+        "server.rs"
+      ]
+    },
+    "src/components": {
+      "path": "src/components",
+      "purpose": "UI components",
+      "fileCount": 1,
+      "lastAccessed": 1776841250237,
+      "keyFiles": [
+        "mod.rs"
+      ]
+    },
+    "tests/data": {
+      "path": "tests/data",
+      "purpose": "Data files",
+      "fileCount": 17,
+      "lastAccessed": 1776841250238,
+      "keyFiles": [
+        "GeoIP2-Anonymous-IP-Test.mmdb",
+        "GeoIP2-City-Test.mmdb",
+        "GeoIP2-Connection-Type-Test.mmdb"
+      ]
+    },
+    "vdev/src": {
+      "path": "vdev/src",
+      "purpose": "Source code",
+      "fileCount": 2,
+      "lastAccessed": 1776841250239,
+      "keyFiles": [
+        "app.rs",
+        "main.rs"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "Cargo.toml",
+      "accessCount": 3,
+      "lastAccessed": 1776845034348,
+      "type": "directory"
+    },
+    {
+      "path": "src/sources/splunk_hec_full/mod.rs",
+      "accessCount": 3,
+      "lastAccessed": 1776845045750,
+      "type": "file"
+    },
+    {
+      "path": "src/sources/mod.rs",
+      "accessCount": 2,
+      "lastAccessed": 1776841343414,
+      "type": "directory"
+    },
+    {
+      "path": "",
+      "accessCount": 1,
+      "lastAccessed": 1776841283485,
+      "type": "directory"
+    },
+    {
+      "path": "src/config/mod.rs",
+      "accessCount": 1,
+      "lastAccessed": 1776841288994,
+      "type": "directory"
+    },
+    {
+      "path": "Makefile",
+      "accessCount": 1,
+      "lastAccessed": 1776841294122,
+      "type": "file"
+    },
+    {
+      "path": "src",
+      "accessCount": 1,
+      "lastAccessed": 1776841326393,
+      "type": "directory"
+    },
+    {
+      "path": "changelog.d/README.md",
+      "accessCount": 1,
+      "lastAccessed": 1776845034461,
+      "type": "file"
+    },
+    {
+      "path": "src/sources/splunk_hec/mod.rs",
+      "accessCount": 1,
+      "lastAccessed": 1776845045615,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}
