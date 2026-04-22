@@ -57,12 +57,13 @@ jobs:
           
           # 拷贝二进制
           cp target/x86_64-unknown-linux-gnu/release/vector target/package/usr/bin/
-          # 拷贝默认配置（可选，方便安装后直接检查）
+          # 拷贝默认配置
           cp config/vector.yaml target/package/etc/vector/vector.yaml.example
           
+          # 运行 fpm (注意：反斜杠后面不要有任何空格或注释)
           fpm -s dir -t rpm \
             -n "vector-custom" \
-            -v "0.54.0" \           # 修改这里，与官方源码版本对齐
+            -v "0.54.0" \
             --architecture x86_64 \
             --description "Vector with Splunk HEC Full plugin" \
             -C target/package .
