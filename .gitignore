@@ -71,3 +71,6 @@ local/
 
 # vscode
 .vscode/
+
+# ai
+.omg/
