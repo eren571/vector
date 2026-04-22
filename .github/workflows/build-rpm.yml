@@ -1,0 +1,95 @@
+name: Build Vector RPM
+
+on:
+  push:
+    branches: [ prod-v0.54.0 ]
+  workflow_dispatch:
+
+env:
+  # 借鉴官方：禁用一些不必要的链接优化以换取更稳定的内存占用
+  DISABLE_MOLD: true
+  # 强制使用 CLI 获取 git 依赖，避免一些网络缓存问题
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  # 限制并发，防止 GitHub 免费 Runner (7GB内存) 编译 Vector 时 OOM
+  CARGO_BUILD_JOBS: 2
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install System Dependencies
+        # 官方 bootstrap 脚本里其实安装了这些，Vector 编译必须要有 protobuf 和 cmake
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            protobuf-compiler \
+            libssl-dev \
+            pkg-config \
+            cmake \
+            build-essential \
+            ruby ruby-dev rubygems rpm
+          sudo gem install --no-document fpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+
+      - name: Build Binary
+        run: |
+          # 使用 --release 构建，并显式指定目标架构
+          cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Package RPM
+        run: |
+          # 建立符合 Linux 层级结构的临时目录
+          mkdir -p target/package/usr/bin
+          mkdir -p target/package/etc/vector
+          
+          # 拷贝二进制
+          cp target/x86_64-unknown-linux-gnu/release/vector target/package/usr/bin/
+          # 拷贝默认配置（可选，方便安装后直接检查）
+          cp config/vector.yaml target/package/etc/vector/vector.yaml.example
+          
+          fpm -s dir -t rpm \
+            -n "vector-custom" \
+            -v "0.54.0" \           # 修改这里，与官方源码版本对齐
+            --architecture x86_64 \
+            --description "Vector with Splunk HEC Full plugin" \
+            -C target/package .
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector-rpm
+          path: ./*.rpm
+
+  verify-rpm:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 模拟官方的验证环境
+        container: ["amazonlinux:2023", "quay.io/centos/centos:stream9"]
+    container:
+      image: ${{ matrix.container }}
+    steps:
+      - name: Download RPM
+        uses: actions/download-artifact@v4
+        with:
+          name: vector-rpm
+          path: ./
+      - name: Test Installation
+        run: |
+          # 检查依赖并安装
+          yum install -y ./vector-custom-*.rpm
+          # 核心验证：运行一次 help 看动态链接库是否都找得到
+          vector --version
+          vector help
