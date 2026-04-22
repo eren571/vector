@@ -625,6 +625,7 @@ impl SplunkSource {
         let log_namespace = self.log_namespace;
         let token_binding_engine = Arc::clone(&self.token_binding_engine);
         let auto_forward_metadata = self.auto_forward_metadata;
+        let fix_bare_string_events = self.fix_bare_string_events;
         let raw_require_channel = self.raw_require_channel;
 
         warp::post()
@@ -702,6 +703,7 @@ impl SplunkSource {
                             batch,
                             log_namespace,
                             &events_received,
+                            fix_bare_string_events,
                         )?;
 
                         // Apply metadata from URL query params (higher priority than token binding)
@@ -1057,6 +1059,23 @@ impl SplunkSource {
                             header_token
                         };
 
+                        // Normalize token: support both "Splunk <token>" and "Basic <base64>" formats
+                        // Splunk HEC docs (RFC 1945): curl -u x:<token> sends "Basic base64(x:token)"
+                        let token = token.map(|t| {
+                            if let Some(b64) = t.strip_prefix("Basic ") {
+                                use base64::prelude::{BASE64_STANDARD, Engine as _};
+                                if let Ok(decoded) = BASE64_STANDARD.decode(b64) {
+                                    if let Ok(s) = String::from_utf8(decoded) {
+                                        // Format: "x:token" or "username:token"
+                                        if let Some((_user, pass)) = s.split_once(':') {
+                                            return format!("Splunk {}", pass);
+                                        }
+                                    }
+                                }
+                            }
+                            t
+                        });
+
                         match (token, valid_credentials.is_empty()) {
                             // No tokens configured - pass through, strip prefix
                             (token, true) => Ok(token
@@ -1386,14 +1405,45 @@ impl<'de, R: JsonRead<'de>> EventIterator<'de, R> {
     }
 
     /// Build the log event for the vector namespace.
-    /// With fix_bare_string_events: wraps bare string events into {"message": "..."}.
+    /// With fix_bare_string_events: wraps non-object events into {"message": value}.
+    /// This prevents scalar values (string, integer, float, boolean, array)
+    /// from being destroyed when metadata fields (index, sourcetype, etc.) are
+    /// inserted at the event root level.
     fn build_log_vector(&mut self, json: &mut JsonValue) -> Result<LogEvent, Rejection> {
         match json.get("event") {
             Some(event) => {
+                // Reject null events (Splunk returns code 13)
+                if event.is_null() {
+                    return Err(ApiError::EmptyEventField { event: self.events }.into());
+                }
+                // Reject empty string events (Splunk returns code 13)
+                if let Some(s) = event.as_str() {
+                    if s.is_empty() {
+                        return Err(ApiError::EmptyEventField { event: self.events }.into());
+                    }
+                }
+                // Reject empty object events
+                if let Some(obj) = event.as_object() {
+                    if obj.is_empty() {
+                        return Err(ApiError::EmptyEventField { event: self.events }.into());
+                    }
+                }
+                // Reject empty array events
+                if let Some(arr) = event.as_array() {
+                    if arr.is_empty() {
+                        return Err(ApiError::EmptyEventField { event: self.events }.into());
+                    }
+                }
+
                 let event: Value = event.into();
 
-                let mut log = if self.fix_bare_string_events && event.is_bytes() {
-                    // Fix: wrap bare string as message field instead of raw bytes at root
+                // Determine if the event needs wrapping.
+                // Object events can safely have metadata fields inserted at root.
+                // All other types (string, integer, float, boolean, array) must be
+                // wrapped as {"message": value} to prevent metadata insertion from
+                // overwriting the scalar value at root.
+                let is_object = event.is_object();
+                let mut log = if self.fix_bare_string_events && !is_object {
                     let mut l = LogEvent::default();
                     l.insert(event_path!("message"), event);
                     l
@@ -1589,6 +1639,7 @@ fn raw_event(
     batch: Option<BatchNotifier>,
     log_namespace: LogNamespace,
     events_received: &Registered<EventsReceived>,
+    fix_bare_string_events: bool,
 ) -> Result<Event, Rejection> {
     // Process gzip
     let message: Value = if gzip {
@@ -1602,12 +1653,25 @@ fn raw_event(
             }
         }
     } else {
+        if bytes.is_empty() {
+            return Err(ApiError::NoData.into());
+        }
         bytes.into()
     };
 
     // Construct event
     let mut log = match log_namespace {
-        LogNamespace::Vector => LogEvent::from(message),
+        LogNamespace::Vector => {
+            // Fix bare string events: wrap string values as {"message": "..."} instead of raw bytes
+            // This prevents serialization issues where bare strings render as {"event":{}}
+            if fix_bare_string_events && message.is_bytes() {
+                let mut l = LogEvent::default();
+                l.insert(event_path!("message"), message);
+                l
+            } else {
+                LogEvent::from(message)
+            }
+        }
         LogNamespace::Legacy => {
             let mut log = LogEvent::default();
             log.maybe_insert(log_schema().message_key_target_path(), message);
@@ -2607,5 +2671,405 @@ mod tests {
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<SplunkHecFullConfig>();
+    }
+
+    // ===================================================================
+    // Audit fix tests — based on Splunk HEC API official documentation
+    // ===================================================================
+
+    // Test: Raw endpoint with URL metadata preserves raw text body
+    #[tokio::test]
+    async fn test_raw_with_url_metadata_preserves_body() {
+        let (source, address, _guard) = source_with_full(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            HashMap::new(),
+            false, // raw_require_channel = false
+        )
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://{address}/services/collector/raw?channel=ch1&index=test_idx&sourcetype=test_type&source=test_src&host=test_host"
+            ))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .body("THIS IS THE RAW TEXT")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let events = collect_n(source, 1).await;
+        let log = events[0].as_log();
+
+        // Raw text MUST be preserved in the "message" field
+        assert_eq!(
+            log.get("message").unwrap().to_string_lossy(),
+            "THIS IS THE RAW TEXT",
+            "Raw text body must be preserved when URL metadata params are present"
+        );
+
+        // URL metadata must also be present
+        assert_eq!(log.get("index").unwrap().to_string_lossy(), "test_idx");
+        assert_eq!(log.get("sourcetype").unwrap().to_string_lossy(), "test_type");
+        assert_eq!(log.get("source").unwrap().to_string_lossy(), "test_src");
+    }
+
+    // Test: Raw endpoint without URL metadata preserves raw text body
+    #[tokio::test]
+    async fn test_raw_without_url_metadata_preserves_body() {
+        let (source, address, _guard) = source_with_full(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            HashMap::new(),
+            false,
+        )
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector/raw?channel=ch1"))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .body("simple raw text")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let events = collect_n(source, 1).await;
+        let log = events[0].as_log();
+
+        // With fix_bare_string_events=true, raw text should be in "message" field
+        assert_eq!(
+            log.get("message").unwrap().to_string_lossy(),
+            "simple raw text"
+        );
+    }
+
+    // Test: Empty string event rejected (Splunk code 13)
+    #[tokio::test]
+    async fn test_empty_string_event_rejected() {
+        let (_source, address, _guard) = source().await;
+        let resp = send_req(
+            address,
+            "event",
+            r#"{"event":""}"#,
+            TOKEN,
+            Some("ch1"),
+            &[],
+        )
+        .await;
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], 13, "Empty string event should return code 13");
+    }
+
+    // Test: Empty object event rejected
+    #[tokio::test]
+    async fn test_empty_object_event_rejected() {
+        let (_source, address, _guard) = source().await;
+        let resp = send_req(
+            address,
+            "event",
+            r#"{"event":{}}"#,
+            TOKEN,
+            Some("ch1"),
+            &[],
+        )
+        .await;
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], 13, "Empty object event should return code 13");
+    }
+
+    // Test: Empty raw body rejected
+    #[tokio::test]
+    async fn test_empty_raw_body_rejected() {
+        let (_source, address, _guard) = source_with_full(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            HashMap::new(),
+            false,
+        )
+        .await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector/raw?channel=ch1"))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .body("")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "Empty raw body should be rejected");
+    }
+
+    // Test: Basic auth (RFC 1945) support
+    #[tokio::test]
+    async fn test_basic_auth_rfc1945() {
+        let (source, address, _guard) = source().await;
+        use base64::prelude::{BASE64_STANDARD, Engine as _};
+        let cred = BASE64_STANDARD.encode(format!("x:{TOKEN}"));
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector/event"))
+            .header("Authorization", format!("Basic {cred}"))
+            .header("x-splunk-request-channel", "ch1")
+            .body(r#"{"event":"basic auth works"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "Basic auth (RFC 1945) should be accepted");
+
+        let events = collect_n(source, 1).await;
+        assert_eq!(events.len(), 1);
+    }
+
+    // Test: Basic auth with invalid token rejected
+    #[tokio::test]
+    async fn test_basic_auth_invalid_rejected() {
+        let (_source, address, _guard) = source().await;
+        use base64::prelude::{BASE64_STANDARD, Engine as _};
+        let cred = BASE64_STANDARD.encode("x:invalid-token");
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector/event"))
+            .header("Authorization", format!("Basic {cred}"))
+            .header("x-splunk-request-channel", "ch1")
+            .body(r#"{"event":"should fail"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    // Test: Batch of mixed string and object events
+    #[tokio::test]
+    async fn test_batch_mixed_string_object_events() {
+        let (source, address, _guard) = source().await;
+        let batch = r#"{"event":"string event"}{"event":{"key":"object event"}}{"event":"another string"}"#;
+        let resp = send_req(address, "event", batch, TOKEN, Some("ch1"), &[]);
+        assert_eq!(resp.status(), 200);
+
+        let events = collect_n(source, 3).await;
+        assert_eq!(events.len(), 3);
+
+        // First event: string should have "message" field
+        let log0 = events[0].as_log();
+        assert!(
+            log0.get("message").is_some(),
+            "String event should have 'message' field"
+        );
+
+        // Second event: object should have "key" field
+        let log1 = events[1].as_log();
+        assert_eq!(log1.get("key").unwrap().to_string_lossy(), "object event");
+
+        // Third event: string should have "message" field
+        let log2 = events[2].as_log();
+        assert!(
+            log2.get("message").is_some(),
+            "String event should have 'message' field"
+        );
+    }
+
+    // Test: Raw endpoint token binding with URL metadata
+    #[tokio::test]
+    async fn test_raw_token_binding_with_url_metadata() {
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            TOKEN.to_string(),
+            TokenBindingConfig {
+                index: Some("binding_idx".to_string()),
+                sourcetype: Some("binding_type".to_string()),
+                source: None,
+            },
+        );
+
+        let (source, address, _guard) = source_with_full(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            bindings,
+            false,
+        )
+        .await;
+
+        // URL params should override token binding
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://{address}/services/collector/raw?channel=ch1&index=url_idx"
+            ))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .body("binding plus url test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let events = collect_n(source, 1).await;
+        let log = events[0].as_log();
+
+        // URL param index should take precedence
+        assert_eq!(log.get("index").unwrap().to_string_lossy(), "url_idx");
+        // Token binding sourcetype should fill in
+        assert_eq!(log.get("sourcetype").unwrap().to_string_lossy(), "binding_type");
+        // Raw text must be preserved
+        assert_eq!(
+            log.get("message").unwrap().to_string_lossy(),
+            "binding plus url test"
+        );
+    }
+
+    // Test: Integer event preserved (not corrupted by metadata)
+    #[tokio::test]
+    async fn test_integer_event_preserved() {
+        let (source, address, _guard) = source().await;
+        let resp = send_req(
+            address,
+            "event",
+            r#"{"event": 42, "index": "test_idx", "sourcetype": "metric"}"#,
+            TOKEN,
+            Some("ch1"),
+            &[],
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+
+        let events = collect_n(source, 1).await;
+        let log = events[0].as_log();
+        // Integer should be wrapped in "message" field to prevent metadata corruption
+        let msg = log.get("message").expect("Integer event should be wrapped in 'message' field");
+        assert_eq!(msg, &Value::Integer(42), "Integer value should be preserved as 42");
+        // Metadata should also be present
+        assert!(log.get("index").is_some(), "index metadata should be present");
+    }
+
+    // Test: Float event preserved
+    #[tokio::test]
+    async fn test_float_event_preserved() {
+        let (source, address, _guard) = source().await;
+        let resp = send_req(
+            address,
+            "event",
+            r#"{"event": 3.14, "index": "metrics"}"#,
+            TOKEN,
+            Some("ch1"),
+            &[],
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+
+        let events = collect_n(source, 1).await;
+        let log = events[0].as_log();
+        let msg = log.get("message").expect("Float event should be wrapped in 'message' field");
+        // Float 3.14 should be preserved
+        match msg {
+            Value::Float(f) => assert!((f.into_inner() - 3.14).abs() < 0.001),
+            _ => panic!("Expected float value, got {:?}", msg),
+        }
+    }
+
+    // Test: Boolean event preserved
+    #[tokio::test]
+    async fn test_boolean_event_preserved() {
+        let (source, address, _guard) = source().await;
+        let resp = send_req(
+            address,
+            "event",
+            r#"{"event": true, "index": "flags"}"#,
+            TOKEN,
+            Some("ch1"),
+            &[],
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+
+        let events = collect_n(source, 1).await;
+        let log = events[0].as_log();
+        let msg = log.get("message").expect("Boolean event should be wrapped in 'message' field");
+        assert_eq!(msg, &Value::Boolean(true), "Boolean true should be preserved");
+    }
+
+    // Test: Array event preserved
+    #[tokio::test]
+    async fn test_array_event_preserved() {
+        let (source, address, _guard) = source().await;
+        let resp = send_req(
+            address,
+            "event",
+            r#"{"event": [1, "two", 3.0], "index": "arrays"}"#,
+            TOKEN,
+            Some("ch1"),
+            &[],
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+
+        let events = collect_n(source, 1).await;
+        let log = events[0].as_log();
+        let msg = log.get("message").expect("Array event should be wrapped in 'message' field");
+        assert!(msg.is_array(), "Array value should be preserved as array");
+    }
+
+    // Test: Null event rejected
+    #[tokio::test]
+    async fn test_null_event_rejected() {
+        let (_source, address, _guard) = source().await;
+        let resp = send_req(
+            address,
+            "event",
+            r#"{"event": null}"#,
+            TOKEN,
+            Some("ch1"),
+            &[],
+        )
+        .await;
+        assert_eq!(resp.status(), 400, "Null event should be rejected");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], 13, "Null event should return code 13");
+    }
+
+    // Test: Empty array event rejected
+    #[tokio::test]
+    async fn test_empty_array_event_rejected() {
+        let (_source, address, _guard) = source().await;
+        let resp = send_req(
+            address,
+            "event",
+            r#"{"event": []}"#,
+            TOKEN,
+            Some("ch1"),
+            &[],
+        )
+        .await;
+        assert_eq!(resp.status(), 400, "Empty array event should be rejected");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], 13, "Empty array event should return code 13");
+    }
+
+    // Test: Batch with mixed data types all preserve values
+    #[tokio::test]
+    async fn test_batch_all_types_preserved() {
+        let (source, address, _guard) = source().await;
+        let batch = r#"{"event":"string val"}{"event":42}{"event":true}{"event":{"k":"v"}}{"event":[1,2]}"#;
+        let resp = send_req(address, "event", batch, TOKEN, Some("ch1"), &[]).await;
+        assert_eq!(resp.status(), 200);
+
+        let events = collect_n(source, 5).await;
+        assert_eq!(events.len(), 5, "All 5 batch events should be received");
+
+        // String -> message
+        assert!(events[0].as_log().get("message").is_some());
+        // Integer -> message
+        assert_eq!(events[1].as_log().get("message").unwrap(), &Value::Integer(42));
+        // Boolean -> message
+        assert_eq!(events[2].as_log().get("message").unwrap(), &Value::Boolean(true));
+        // Object -> keys at root
+        assert_eq!(events[3].as_log().get("k").unwrap().to_string_lossy(), "v");
+        // Array -> message
+        assert!(events[4].as_log().get("message").unwrap().is_array());
     }
 }
