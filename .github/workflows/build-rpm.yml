@@ -11,11 +11,11 @@ env:
   # 强制使用 CLI 获取 git 依赖，避免一些网络缓存问题
   CARGO_NET_GIT_FETCH_WITH_CLI: true
   # 限制并发，防止 GitHub 免费 Runner (7GB内存) 编译 Vector 时 OOM
-  CARGO_BUILD_JOBS: 2
+  CARGO_BUILD_JOBS: 3
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
