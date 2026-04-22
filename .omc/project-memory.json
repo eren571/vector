@@ -1,0 +1,314 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1776757380346,
+  "projectRoot": "/Users/erenyong/Desktop/code/vector",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Rust",
+        "version": "1.92",
+        "confidence": "high",
+        "markers": [
+          "Cargo.toml"
+        ]
+      },
+      {
+        "name": "C/C++",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "Makefile"
+        ]
+      }
+    ],
+    "frameworks": [
+      {
+        "name": "axum",
+        "version": null,
+        "category": "backend"
+      }
+    ],
+    "packageManager": "cargo",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": "cargo build",
+    "testCommand": "cargo test",
+    "lintCommand": "cargo clippy",
+    "devCommand": "cargo run",
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": "type-based"
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "docs",
+      "lib",
+      "scripts",
+      "src",
+      "tests"
+    ],
+    "gitBranches": {
+      "defaultBranch": "master",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "benches": {
+      "path": "benches",
+      "purpose": null,
+      "fileCount": 13,
+      "lastAccessed": 1776757380304,
+      "keyFiles": [
+        "batch.rs",
+        "default.rs",
+        "distribution_statistic.rs",
+        "enrichment_tables.rs",
+        "event.rs"
+      ]
+    },
+    "changelog.d": {
+      "path": "changelog.d",
+      "purpose": null,
+      "fileCount": 32,
+      "lastAccessed": 1776757380305,
+      "keyFiles": [
+        "23657-grpc-health-protocol.enhancement.md",
+        "24291_async_nats_websockets.feature.md",
+        "24411_geoip_network_field.enhancement.md",
+        "24455_otel_source_per_signal_decoding.enhancement.md",
+        "24532_vector_stopped_log_ordering.fix.md"
+      ]
+    },
+    "config": {
+      "path": "config",
+      "purpose": "Configuration files",
+      "fileCount": 2,
+      "lastAccessed": 1776757380306,
+      "keyFiles": [
+        "README.md",
+        "vector.yaml"
+      ]
+    },
+    "distribution": {
+      "path": "distribution",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1776757380307,
+      "keyFiles": [
+        "install.sh"
+      ]
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 9,
+      "lastAccessed": 1776757380307,
+      "keyFiles": [
+        "ARCHITECTURE.md",
+        "DEPRECATION.md",
+        "DEPRECATIONS.md",
+        "DEVELOPING.md",
+        "DOCUMENTING.md"
+      ]
+    },
+    "lib": {
+      "path": "lib",
+      "purpose": "Library code",
+      "fileCount": 0,
+      "lastAccessed": 1776757380307,
+      "keyFiles": []
+    },
+    "licenses": {
+      "path": "licenses",
+      "purpose": null,
+      "fileCount": 16,
+      "lastAccessed": 1776757380308,
+      "keyFiles": [
+        "0BSD",
+        "Apache-2.0",
+        "BSD-2-Clause",
+        "BSD-3-Clause",
+        "BSL-1.0"
+      ]
+    },
+    "proto": {
+      "path": "proto",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1776757380308,
+      "keyFiles": []
+    },
+    "regression": {
+      "path": "regression",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1776757380310,
+      "keyFiles": [
+        "Dockerfile",
+        "config.yaml"
+      ]
+    },
+    "rfcs": {
+      "path": "rfcs",
+      "purpose": null,
+      "fileCount": 74,
+      "lastAccessed": 1776757380310,
+      "keyFiles": [
+        "2020-03-06-1999-api-extensions-for-lua-transform.md",
+        "2020-03-17-2064-event-driven-observability.md",
+        "2020-04-04-2221-kubernetes-integration.md",
+        "2020-04-06-1858-automatically-adjust-request-limits.md",
+        "2020-04-15-2341-wasm-plugins.md"
+      ]
+    },
+    "rust-doc": {
+      "path": "rust-doc",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1776757380311,
+      "keyFiles": [
+        "Makefile"
+      ]
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 37,
+      "lastAccessed": 1776757380312,
+      "keyFiles": [
+        "Gemfile",
+        "Gemfile.lock",
+        "README.md",
+        "build-docker.sh",
+        "build.sh"
+      ]
+    },
+    "src": {
+      "path": "src",
+      "purpose": "Source code",
+      "fileCount": 35,
+      "lastAccessed": 1776757380313,
+      "keyFiles": [
+        "amqp.rs",
+        "app.rs",
+        "async_read.rs",
+        "cli.rs",
+        "completion.rs"
+      ]
+    },
+    "testing": {
+      "path": "testing",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1776757380314,
+      "keyFiles": []
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 0,
+      "lastAccessed": 1776757380314,
+      "keyFiles": []
+    },
+    "tilt": {
+      "path": "tilt",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1776757380315,
+      "keyFiles": [
+        "Dockerfile"
+      ]
+    },
+    "vdev": {
+      "path": "vdev",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1776757380315,
+      "keyFiles": [
+        "Cargo.toml",
+        "README.md"
+      ]
+    },
+    "website": {
+      "path": "website",
+      "purpose": null,
+      "fileCount": 18,
+      "lastAccessed": 1776757380315,
+      "keyFiles": [
+        "Makefile",
+        "README.md",
+        "algolia.json",
+        "babel.config.js",
+        "config.toml"
+      ]
+    },
+    "config/examples": {
+      "path": "config/examples",
+      "purpose": "Example code",
+      "fileCount": 9,
+      "lastAccessed": 1776757380316,
+      "keyFiles": [
+        "docs_example.yaml",
+        "environment_variables.yaml",
+        "es_s3_hybrid.yaml"
+      ]
+    },
+    "src/api": {
+      "path": "src/api",
+      "purpose": "API routes",
+      "fileCount": 2,
+      "lastAccessed": 1776757380318,
+      "keyFiles": [
+        "grpc_server.rs",
+        "mod.rs"
+      ]
+    },
+    "src/components": {
+      "path": "src/components",
+      "purpose": "UI components",
+      "fileCount": 1,
+      "lastAccessed": 1776757380318,
+      "keyFiles": [
+        "mod.rs"
+      ]
+    },
+    "tests/data": {
+      "path": "tests/data",
+      "purpose": "Data files",
+      "fileCount": 18,
+      "lastAccessed": 1776757380319,
+      "keyFiles": [
+        "ClientCertificateAuth.pfx",
+        "GeoIP2-Anonymous-IP-Test.mmdb",
+        "GeoIP2-City-Test.mmdb"
+      ]
+    },
+    "vdev/src": {
+      "path": "vdev/src",
+      "purpose": "Source code",
+      "fileCount": 2,
+      "lastAccessed": 1776757380319,
+      "keyFiles": [
+        "app.rs",
+        "main.rs"
+      ]
+    },
+    "website/assets": {
+      "path": "website/assets",
+      "purpose": "Static assets",
+      "fileCount": 0,
+      "lastAccessed": 1776757380319,
+      "keyFiles": []
+    }
+  },
+  "hotPaths": [],
+  "userDirectives": []
+}
