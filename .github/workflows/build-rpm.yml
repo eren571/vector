@@ -22,7 +22,6 @@ jobs:
           fetch-depth: 0
 
       - name: Install System Dependencies
-        # 官方 bootstrap 脚本里其实安装了这些，Vector 编译必须要有 protobuf 和 cmake
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -31,6 +30,9 @@ jobs:
             pkg-config \
             cmake \
             build-essential \
+            libsasl2-dev \
+            libzstd-dev \
+            libclang-dev \
             ruby ruby-dev rubygems rpm
           sudo gem install --no-document fpm
 
