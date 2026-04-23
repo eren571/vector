@@ -3,7 +3,6 @@ use std::{
     convert::Infallible,
     io::Read,
     net::{Ipv4Addr, SocketAddr},
-    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -56,7 +55,6 @@ use self::{
         IndexerAcknowledgement,
     },
     splunk_response::{HecResponse, HecResponseMetadata, HecStatusCode},
-    token_binding::{TokenBindingConfig, TokenBindingEngine},
 };
 use crate::{
     SourceSender,
@@ -69,7 +67,6 @@ use crate::{
 };
 
 mod acknowledgements;
-pub mod token_binding;
 
 // Event fields unique to splunk_hec_full source (same as splunk_hec for compatibility)
 pub const CHANNEL: &str = "splunk_channel";
@@ -146,20 +143,6 @@ pub struct SplunkHecFullConfig {
     #[serde(default = "default_true")]
     allow_query_string_auth: bool,
 
-    /// Token-to-metadata binding table.
-    ///
-    /// Maps HEC tokens to default metadata (index, sourcetype, source).
-    /// When an event is received with a bound token, these defaults are applied
-    /// unless overridden by the event body or URL query parameters.
-    #[serde(default)]
-    token_bindings: HashMap<String, TokenBindingConfig>,
-
-    /// Path to a Splunk inputs.conf file to load token bindings from.
-    ///
-    /// The file is read at startup. Token bindings from the config file
-    /// take precedence over those loaded from inputs.conf.
-    inputs_conf_path: Option<PathBuf>,
-
     /// Automatically write metadata fields (index, sourcetype, source) as
     /// event-level fields without the `splunk_` prefix, in addition to the
     /// standard prefixed fields.
@@ -214,8 +197,6 @@ impl Default for SplunkHecFullConfig {
             log_namespace: None,
             keepalive: Default::default(),
             allow_query_string_auth: true,
-            token_bindings: HashMap::new(),
-            inputs_conf_path: None,
             auto_forward_metadata: true,
             fix_bare_string_events: true,
             raw_require_channel: true,
@@ -239,7 +220,7 @@ impl SourceConfig for SplunkHecFullConfig {
 
         let event_service = source.event_service(out.clone());
         let raw_service = source.raw_service(out.clone());
-        let s2s_service = source.s2s_service(out);
+        let _ = out;
         let health_service = source.health_service();
         let ack_service = source.ack_service();
         let options = SplunkSource::options();
@@ -248,8 +229,6 @@ impl SourceConfig for SplunkHecFullConfig {
             .and(
                 event_service
                     .or(raw_service)
-                    .unify()
-                    .or(s2s_service)
                     .unify()
                     .or(health_service)
                     .unify()
@@ -432,7 +411,6 @@ struct SplunkSource {
     log_namespace: LogNamespace,
     events_received: Registered<EventsReceived>,
     allow_query_string_auth: bool,
-    token_binding_engine: Arc<TokenBindingEngine>,
     auto_forward_metadata: bool,
     fix_bare_string_events: bool,
     raw_require_channel: bool,
@@ -461,13 +439,6 @@ impl SplunkSource {
             ))
         });
 
-        // Build token binding engine
-        let token_binding_engine = TokenBindingEngine::from_config_and_inputs_conf(
-            &config.token_bindings,
-            config.inputs_conf_path.as_deref(),
-        )
-        .map_err(|e| format!("Failed to initialize token binding engine: {}", e))?;
-
         Ok(SplunkSource {
             valid_credentials: valid_tokens
                 .map(|token| format!("Splunk {}", token.inner()))
@@ -478,7 +449,6 @@ impl SplunkSource {
             log_namespace,
             events_received: register!(EventsReceived),
             allow_query_string_auth: config.allow_query_string_auth,
-            token_binding_engine: Arc::new(token_binding_engine),
             auto_forward_metadata: config.auto_forward_metadata,
             fix_bare_string_events: config.fix_bare_string_events,
             raw_require_channel: config.raw_require_channel,
@@ -509,7 +479,6 @@ impl SplunkSource {
         let store_hec_token = self.store_hec_token;
         let log_namespace = self.log_namespace;
         let events_received = self.events_received.clone();
-        let token_binding_engine = Arc::clone(&self.token_binding_engine);
         let auto_forward_metadata = self.auto_forward_metadata;
         let fix_bare_string_events = self.fix_bare_string_events;
 
@@ -538,7 +507,6 @@ impl SplunkSource {
                     let mut out = out.clone();
                     let idx_ack = idx_ack.clone();
                     let events_received = events_received.clone();
-                    let token_binding_engine = Arc::clone(&token_binding_engine);
 
                     async move {
                         if idx_ack.is_some() && channel.is_none() {
@@ -575,11 +543,6 @@ impl SplunkSource {
                         let mut error = None;
                         let mut events = Vec::new();
 
-                        // Resolve token binding defaults
-                        let binding = token
-                            .as_deref()
-                            .and_then(|t| token_binding_engine.resolve(t));
-
                         let iter: EventIterator<'_, StrRead<'_>> = EventIteratorGenerator {
                             deserializer: Deserializer::from_str(&body).into_iter::<JsonValue>(),
                             channel,
@@ -589,7 +552,6 @@ impl SplunkSource {
                             token: token.filter(|_| store_hec_token).map(Into::into),
                             log_namespace,
                             events_received,
-                            token_binding: binding.cloned(),
                             auto_forward_metadata,
                             fix_bare_string_events,
                             auto_extract_timestamp: auto_extract_ts,
@@ -636,7 +598,6 @@ impl SplunkSource {
         let store_hec_token = self.store_hec_token;
         let events_received = self.events_received.clone();
         let log_namespace = self.log_namespace;
-        let token_binding_engine = Arc::clone(&self.token_binding_engine);
         let auto_forward_metadata = self.auto_forward_metadata;
         let fix_bare_string_events = self.fix_bare_string_events;
         let raw_require_channel = self.raw_require_channel;
@@ -667,7 +628,6 @@ impl SplunkSource {
                     let mut out = out.clone();
                     let idx_ack = idx_ack.clone();
                     let events_received = events_received.clone();
-                    let token_binding_engine = Arc::clone(&token_binding_engine);
 
                     emit!(HttpBytesReceived {
                         byte_size: body.len(),
@@ -702,11 +662,6 @@ impl SplunkSource {
                             _ => None,
                         };
 
-                        // Resolve token binding defaults
-                        let binding = token
-                            .as_deref()
-                            .and_then(|t| token_binding_engine.resolve(t));
-
                         // Build raw event(s)
                         // When raw_line_splitting is enabled, split body by newlines into multiple events
                         let mut events = if raw_line_splitting {
@@ -735,18 +690,11 @@ impl SplunkSource {
                             )?]
                         };
 
-                        // Compute final metadata values (shared across all events):
-                        // Priority: URL query params > token binding defaults
+                        // Compute final metadata values (shared across all events)
                         let final_host = query_params.host;
-                        let final_index = query_params
-                            .index
-                            .or_else(|| binding.and_then(|b| b.index.clone()));
-                        let final_sourcetype = query_params
-                            .sourcetype
-                            .or_else(|| binding.and_then(|b| b.sourcetype.clone()));
-                        let final_source = query_params
-                            .source
-                            .or_else(|| binding.and_then(|b| b.source.clone()));
+                        let final_index = query_params.index;
+                        let final_sourcetype = query_params.sourcetype;
+                        let final_source = query_params.source;
 
                         // Apply metadata + token + time to each event
                         for event in events.iter_mut() {
@@ -945,125 +893,13 @@ impl SplunkSource {
             .boxed()
     }
 
-    fn s2s_service(&self, out: SourceSender) -> BoxedFilter<(Response,)> {
-        let protocol = self.protocol;
-        let store_hec_token = self.store_hec_token;
-        let events_received = self.events_received.clone();
-        let log_namespace = self.log_namespace;
-
-        warp::post()
-            .and(path!("s2s"))
-            .and(self.authorization())
-            .and(warp::addr::remote())
-            .and(warp::header::optional::<String>("X-Forwarded-For"))
-            .and(self.gzip())
-            .and(warp::body::bytes())
-            .and(warp::path::full())
-            .and_then(
-                move |token: Option<String>,
-                      remote: Option<SocketAddr>,
-                      xff: Option<String>,
-                      gzip: bool,
-                      body: Bytes,
-                      path: warp::path::FullPath| {
-                    let mut out = out.clone();
-                    let events_received = events_received.clone();
-
-                    emit!(HttpBytesReceived {
-                        byte_size: body.len(),
-                        http_path: path.as_str(),
-                        protocol,
-                    });
-
-                    async move {
-                        // Decompress if gzipped
-                        let data: Bytes = if gzip {
-                            let mut buf = Vec::new();
-                            MultiGzDecoder::new(body.reader())
-                                .read_to_end(&mut buf)
-                                .map_err(|_| Rejection::from(ApiError::BadRequest))?;
-                            Bytes::from(buf)
-                        } else {
-                            body
-                        };
-
-                        if data.is_empty() {
-                            return Err(Rejection::from(ApiError::NoData));
-                        }
-
-                        // Build a log event with the raw S2S payload
-                        let mut log = match log_namespace {
-                            LogNamespace::Vector => LogEvent::from(Value::from(data)),
-                            LogNamespace::Legacy => {
-                                let mut l = LogEvent::default();
-                                l.maybe_insert(
-                                    log_schema().message_key_target_path(),
-                                    Value::from(data),
-                                );
-                                l
-                            }
-                        };
-
-                        events_received
-                            .emit(CountByteSize(1, log.estimated_json_encoded_size_of()));
-
-                        // Mark as S2S format for downstream routing
-                        log.insert(event_path!("_s2s"), Value::from(true));
-                        log.insert(
-                            event_path!("_s2s_content_type"),
-                            Value::from("application/octet-stream"),
-                        );
-
-                        // Host from XFF or remote addr
-                        let host = xff.or_else(|| remote.map(|r| r.to_string()));
-                        if let Some(host_val) = host {
-                            log_namespace.insert_source_metadata(
-                                SplunkHecFullConfig::NAME,
-                                &mut log,
-                                log_schema().host_key().map(LegacyKey::InsertIfEmpty),
-                                lookup::path!("host"),
-                                host_val,
-                            );
-                        }
-
-                        log_namespace.insert_standard_vector_source_metadata(
-                            &mut log,
-                            SplunkHecFullConfig::NAME,
-                            Utc::now(),
-                        );
-
-                        log_namespace.insert_vector_metadata(
-                            &mut log,
-                            log_schema().source_type_key(),
-                            &owned_value_path!("source_type"),
-                            SplunkHecFullConfig::NAME,
-                        );
-
-                        // Store HEC token for passthrough
-                        if let Some(tok) = token.filter(|_| store_hec_token) {
-                            log.metadata_mut().set_splunk_hec_token(tok.into());
-                        }
-
-                        let event = Event::from(log);
-                        out.send_event(event)
-                            .await
-                            .map(|_| None) // No ackId for S2S
-                            .map_err(|_| Rejection::from(ApiError::ServerShutdown))
-                    }
-                },
-            )
-            .map(finish_ok)
-            .boxed()
-    }
-
     fn options() -> BoxedFilter<(Response,)> {
         let post = warp::options()
             .and(
                 path!("event")
                     .or(path!("event" / "1.0"))
                     .or(path!("raw" / "1.0"))
-                    .or(path!("raw"))
-                    .or(path!("s2s")),
+                    .or(path!("raw")),
             )
             .map(|_| warp::reply::with_header(warp::reply(), "Allow", "POST").into_response());
 
@@ -1188,8 +1024,6 @@ struct EventIterator<'de, R: JsonRead<'de>> {
     log_namespace: LogNamespace,
     /// handle to EventsReceived registry
     events_received: Registered<EventsReceived>,
-    /// Token binding defaults (resolved from token_bindings config)
-    token_binding: Option<token_binding::TokenBinding>,
     /// Whether to auto-forward metadata as event-level fields
     auto_forward_metadata: bool,
     /// Whether to fix bare string events
@@ -1208,7 +1042,6 @@ struct EventIteratorGenerator<'de, R: JsonRead<'de>> {
     events_received: Registered<EventsReceived>,
     remote: Option<SocketAddr>,
     remote_addr: Option<String>,
-    token_binding: Option<token_binding::TokenBinding>,
     auto_forward_metadata: bool,
     fix_bare_string_events: bool,
     auto_extract_timestamp: bool,
@@ -1242,7 +1075,6 @@ impl<'de, R: JsonRead<'de>> From<EventIteratorGenerator<'de, R>> for EventIterat
             token: f.token,
             log_namespace: f.log_namespace,
             events_received: f.events_received,
-            token_binding: f.token_binding,
             auto_forward_metadata: f.auto_forward_metadata,
             fix_bare_string_events: f.fix_bare_string_events,
             auto_extract_timestamp: f.auto_extract_timestamp,
@@ -1349,72 +1181,20 @@ impl<'de, R: JsonRead<'de>> EventIterator<'de, R> {
             de.extract(&mut log, &mut json);
         }
 
-        // Apply token binding defaults for fields not already set by extractors
-        if let Some(binding) = &self.token_binding {
-            // index - only apply if extractor didn't set it
-            if self.extractors[1].value.is_none()
-                && let Some(index_val) = &binding.index
-            {
-                self.log_namespace.insert_source_metadata(
-                    SplunkHecFullConfig::NAME,
-                    &mut log,
-                    Some(LegacyKey::Overwrite(&owned_value_path!(INDEX))),
-                    lookup::path!("index"),
-                    index_val.clone(),
-                );
-            }
-            // source - only apply if extractor didn't set it
-            if self.extractors[2].value.is_none()
-                && let Some(source_val) = &binding.source
-            {
-                self.log_namespace.insert_source_metadata(
-                    SplunkHecFullConfig::NAME,
-                    &mut log,
-                    Some(LegacyKey::Overwrite(&owned_value_path!(SOURCE))),
-                    lookup::path!("source"),
-                    source_val.clone(),
-                );
-            }
-            // sourcetype - only apply if extractor didn't set it
-            if self.extractors[3].value.is_none()
-                && let Some(sourcetype_val) = &binding.sourcetype
-            {
-                self.log_namespace.insert_source_metadata(
-                    SplunkHecFullConfig::NAME,
-                    &mut log,
-                    Some(LegacyKey::Overwrite(&owned_value_path!(SOURCETYPE))),
-                    lookup::path!("sourcetype"),
-                    sourcetype_val.clone(),
-                );
-            }
-        }
-
         // Auto-forward metadata as event-level fields (without splunk_ prefix)
         if self.auto_forward_metadata {
             // index
-            let index_val = self.extractors[1].value.clone().or_else(|| {
-                self.token_binding
-                    .as_ref()
-                    .and_then(|b| b.index.clone().map(Value::from))
-            });
+            let index_val = self.extractors[1].value.clone();
             if let Some(val) = index_val {
                 log.insert(event_path!("index"), val);
             }
             // source
-            let source_val = self.extractors[2].value.clone().or_else(|| {
-                self.token_binding
-                    .as_ref()
-                    .and_then(|b| b.source.clone().map(Value::from))
-            });
+            let source_val = self.extractors[2].value.clone();
             if let Some(val) = source_val {
                 log.insert(event_path!("source"), val);
             }
             // sourcetype
-            let sourcetype_val = self.extractors[3].value.clone().or_else(|| {
-                self.token_binding
-                    .as_ref()
-                    .and_then(|b| b.sourcetype.clone().map(Value::from))
-            });
+            let sourcetype_val = self.extractors[3].value.clone();
             if let Some(val) = sourcetype_val {
                 log.insert(event_path!("sourcetype"), val);
             }
@@ -2128,7 +1908,6 @@ mod tests {
         valid_tokens: Option<&[&str]>,
         acknowledgements: Option<HecAcknowledgementsConfig>,
         store_hec_token: bool,
-        token_bindings: HashMap<String, TokenBindingConfig>,
     ) -> (
         impl Stream<Item = Event> + Unpin + use<>,
         SocketAddr,
@@ -2150,11 +1929,10 @@ mod tests {
                 log_namespace: None,
                 keepalive: Default::default(),
                 allow_query_string_auth: true,
-                token_bindings,
-                inputs_conf_path: None,
                 auto_forward_metadata: true,
                 fix_bare_string_events: true,
                 raw_require_channel: true,
+                raw_line_splitting: false,
             }
             .build(cx)
             .await
@@ -2172,7 +1950,6 @@ mod tests {
             None,
             None,
             false,
-            HashMap::new(),
         )
         .await
     }
@@ -2182,7 +1959,6 @@ mod tests {
         valid_tokens: Option<&[&str]>,
         acknowledgements: Option<HecAcknowledgementsConfig>,
         store_hec_token: bool,
-        token_bindings: HashMap<String, TokenBindingConfig>,
         raw_require_channel: bool,
     ) -> (
         impl Stream<Item = Event> + Unpin + use<>,
@@ -2194,7 +1970,6 @@ mod tests {
             valid_tokens,
             acknowledgements,
             store_hec_token,
-            token_bindings,
             raw_require_channel,
             false, // raw_line_splitting default off
         )
@@ -2206,7 +1981,6 @@ mod tests {
         valid_tokens: Option<&[&str]>,
         acknowledgements: Option<HecAcknowledgementsConfig>,
         store_hec_token: bool,
-        token_bindings: HashMap<String, TokenBindingConfig>,
         raw_require_channel: bool,
         raw_line_splitting: bool,
     ) -> (
@@ -2230,8 +2004,6 @@ mod tests {
                 log_namespace: None,
                 keepalive: Default::default(),
                 allow_query_string_auth: true,
-                token_bindings,
-                inputs_conf_path: None,
                 auto_forward_metadata: true,
                 fix_bare_string_events: true,
                 raw_require_channel,
@@ -2301,7 +2073,6 @@ mod tests {
             Some(&["url-token", "header-token"]),
             None,
             true,
-            HashMap::new(),
         )
         .await;
 
@@ -2385,87 +2156,6 @@ mod tests {
         assert_eq!(log.get("source").unwrap().to_string_lossy(), "my_source");
     }
 
-    // Test: Token binding applies defaults
-    #[tokio::test]
-    async fn test_token_binding_defaults() {
-        let mut bindings = HashMap::new();
-        bindings.insert(
-            TOKEN.to_string(),
-            TokenBindingConfig {
-                index: Some("bound_index".to_string()),
-                sourcetype: Some("bound_type".to_string()),
-                source: None,
-            },
-        );
-
-        let (source, address, _guard) =
-            source_with(Some(TOKEN.to_owned().into()), None, None, false, bindings).await;
-
-        let resp = send_req(
-            address,
-            "event",
-            r#"{"event":"binding test"}"#,
-            TOKEN,
-            Some("ch"),
-            &[],
-        )
-        .await;
-        assert_eq!(resp.status(), 200);
-
-        let events = collect_n(source, 1).await;
-        let log = events[0].as_log();
-
-        assert_eq!(
-            log.get("splunk_index").unwrap().to_string_lossy(),
-            "bound_index"
-        );
-        assert_eq!(
-            log.get("splunk_sourcetype").unwrap().to_string_lossy(),
-            "bound_type"
-        );
-    }
-
-    // Test: Event body overrides token binding
-    #[tokio::test]
-    async fn test_event_body_overrides_binding() {
-        let mut bindings = HashMap::new();
-        bindings.insert(
-            TOKEN.to_string(),
-            TokenBindingConfig {
-                index: Some("bound_index".to_string()),
-                sourcetype: Some("bound_type".to_string()),
-                source: None,
-            },
-        );
-
-        let (source, address, _guard) =
-            source_with(Some(TOKEN.to_owned().into()), None, None, false, bindings).await;
-
-        let resp = send_req(
-            address,
-            "event",
-            r#"{"event":"override test","index":"body_index","sourcetype":"body_type"}"#,
-            TOKEN,
-            Some("ch"),
-            &[],
-        )
-        .await;
-        assert_eq!(resp.status(), 200);
-
-        let events = collect_n(source, 1).await;
-        let log = events[0].as_log();
-
-        // Body values should override token binding
-        assert_eq!(
-            log.get("splunk_index").unwrap().to_string_lossy(),
-            "body_index"
-        );
-        assert_eq!(
-            log.get("splunk_sourcetype").unwrap().to_string_lossy(),
-            "body_type"
-        );
-    }
-
     // Test: Bare string fix in vector namespace
     #[tokio::test]
     async fn test_bare_string_fix() {
@@ -2483,11 +2173,10 @@ mod tests {
                 log_namespace: Some(true), // Vector namespace
                 keepalive: Default::default(),
                 allow_query_string_auth: true,
-                token_bindings: HashMap::new(),
-                inputs_conf_path: None,
                 auto_forward_metadata: true,
                 fix_bare_string_events: true,
                 raw_require_channel: true,
+                raw_line_splitting: false,
             }
             .build(cx)
             .await
@@ -2652,7 +2341,6 @@ mod tests {
             None,
             None,
             false,
-            HashMap::new(),
             false, // raw_require_channel = false
         )
         .await;
@@ -2774,84 +2462,6 @@ mod tests {
         assert!(log.get("auto_extract_timestamp").is_none());
     }
 
-    // === Improvement 5: S2S endpoint tests ===
-
-    // Test: S2S basic event
-    #[tokio::test]
-    async fn test_s2s_endpoint_basic() {
-        let (source, address, _guard) = source().await;
-        let resp = reqwest::Client::new()
-            .post(format!("http://{address}/services/collector/s2s"))
-            .header("Authorization", format!("Splunk {TOKEN}"))
-            .header("Content-Type", "application/octet-stream")
-            .body(b"\x00\x01\x02\x03binary s2s data".to_vec())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-
-        let events = collect_n(source, 1).await;
-        let log = events[0].as_log();
-        assert_eq!(log.get("_s2s").unwrap().to_string_lossy(), "true");
-        assert_eq!(
-            log.get("_s2s_content_type").unwrap().to_string_lossy(),
-            "application/octet-stream"
-        );
-    }
-
-    // Test: S2S without auth returns 401
-    #[tokio::test]
-    async fn test_s2s_endpoint_no_auth() {
-        let (_source, address, _guard) = source().await;
-        let resp = reqwest::Client::new()
-            .post(format!("http://{address}/services/collector/s2s"))
-            .header("Content-Type", "application/octet-stream")
-            .body(b"no auth".to_vec())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401);
-    }
-
-    // Test: S2S with empty body returns 400
-    #[tokio::test]
-    async fn test_s2s_endpoint_empty_body() {
-        let (_source, address, _guard) = source().await;
-        let resp = reqwest::Client::new()
-            .post(format!("http://{address}/services/collector/s2s"))
-            .header("Authorization", format!("Splunk {TOKEN}"))
-            .body(b"".to_vec())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400); // NoData
-    }
-
-    // Test: S2S token passthrough
-    #[tokio::test]
-    async fn test_s2s_token_passthrough() {
-        let (source, address, _guard) = source_with(
-            Some(TOKEN.to_owned().into()),
-            None,
-            None,
-            true,
-            HashMap::new(),
-        )
-        .await;
-        let resp = reqwest::Client::new()
-            .post(format!("http://{address}/services/collector/s2s"))
-            .header("Authorization", format!("Splunk {TOKEN}"))
-            .body(b"s2s with token".to_vec())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-
-        let events = collect_n(source, 1).await;
-        let log = events[0].as_log();
-        assert_eq!(log.metadata().splunk_hec_token().unwrap().as_ref(), TOKEN);
-    }
-
     // Test: Generate config
     #[test]
     fn generate_config() {
@@ -2870,7 +2480,6 @@ mod tests {
             None,
             None,
             false,
-            HashMap::new(),
             false, // raw_require_channel = false
         )
         .await;
@@ -2910,7 +2519,6 @@ mod tests {
             None,
             None,
             false,
-            HashMap::new(),
             false,
         )
         .await;
@@ -2978,7 +2586,6 @@ mod tests {
             None,
             None,
             false,
-            HashMap::new(),
             false,
         )
         .await;
@@ -3034,7 +2641,7 @@ mod tests {
     async fn test_batch_mixed_string_object_events() {
         let (source, address, _guard) = source().await;
         let batch = r#"{"event":"string event"}{"event":{"key":"object event"}}{"event":"another string"}"#;
-        let resp = send_req(address, "event", batch, TOKEN, Some("ch1"), &[]);
+        let resp = send_req(address, "event", batch, TOKEN, Some("ch1"), &[]).await;
         assert_eq!(resp.status(), 200);
 
         let events = collect_n(source, 3).await;
@@ -3056,55 +2663,6 @@ mod tests {
         assert!(
             log2.get("message").is_some(),
             "String event should have 'message' field"
-        );
-    }
-
-    // Test: Raw endpoint token binding with URL metadata
-    #[tokio::test]
-    async fn test_raw_token_binding_with_url_metadata() {
-        let mut bindings = HashMap::new();
-        bindings.insert(
-            TOKEN.to_string(),
-            TokenBindingConfig {
-                index: Some("binding_idx".to_string()),
-                sourcetype: Some("binding_type".to_string()),
-                source: None,
-            },
-        );
-
-        let (source, address, _guard) = source_with_full(
-            Some(TOKEN.to_owned().into()),
-            None,
-            None,
-            false,
-            bindings,
-            false,
-        )
-        .await;
-
-        // URL params should override token binding
-        let resp = reqwest::Client::new()
-            .post(format!(
-                "http://{address}/services/collector/raw?channel=ch1&index=url_idx"
-            ))
-            .header("Authorization", format!("Splunk {TOKEN}"))
-            .body("binding plus url test")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-
-        let events = collect_n(source, 1).await;
-        let log = events[0].as_log();
-
-        // URL param index should take precedence
-        assert_eq!(log.get("index").unwrap().to_string_lossy(), "url_idx");
-        // Token binding sourcetype should fill in
-        assert_eq!(log.get("sourcetype").unwrap().to_string_lossy(), "binding_type");
-        // Raw text must be preserved
-        assert_eq!(
-            log.get("message").unwrap().to_string_lossy(),
-            "binding plus url test"
         );
     }
 
@@ -3266,7 +2824,6 @@ mod tests {
             None,
             None,
             false,
-            HashMap::new(),
             false, // raw_require_channel
             true,  // raw_line_splitting
         )
@@ -3306,7 +2863,6 @@ mod tests {
             None,
             None,
             false,
-            HashMap::new(),
             false,
             true, // raw_line_splitting
         )
@@ -3352,7 +2908,6 @@ mod tests {
             None,
             None,
             false,
-            HashMap::new(),
             false,
             false, // raw_line_splitting OFF
         )
