@@ -149,7 +149,7 @@ pub struct SplunkHecFullConfig {
     ///
     /// This enables zero-config transparent forwarding to a `splunk_hec_logs` sink
     /// when the sink uses templates like `index: "{{ index }}"`.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     auto_forward_metadata: bool,
 
     /// Fix bare string events in the Vector log namespace.
@@ -201,7 +201,7 @@ impl Default for SplunkHecFullConfig {
             log_namespace: None,
             keepalive: Default::default(),
             allow_query_string_auth: false,
-            auto_forward_metadata: true,
+            auto_forward_metadata: false,
             fix_bare_string_events: true,
             raw_require_channel: false,
             raw_line_splitting: false,
@@ -396,6 +396,7 @@ struct EventQueryParams {
     #[allow(dead_code)]
     token: Option<String>,
     auto_extract_timestamp: Option<String>,
+    index: Option<String>,
 }
 
 impl EventQueryParams {
@@ -474,7 +475,7 @@ impl SplunkSource {
                 |header: Option<String>, params: EventQueryParams| {
                     let auto_extract_ts = params.auto_extract_timestamp_enabled();
                     let channel = header.or(params.channel);
-                    (channel, auto_extract_ts)
+                    (channel, auto_extract_ts, params.index)
                 },
             );
 
@@ -502,7 +503,7 @@ impl SplunkSource {
             .and_then(
                 move |_,
                       token: Option<String>,
-                      (channel, auto_extract_ts): (Option<String>, bool),
+                        (channel, auto_extract_ts, query_index): (Option<String>, bool, Option<String>),
                       remote: Option<SocketAddr>,
                       remote_addr: Option<String>,
                       gzip: bool,
@@ -516,6 +517,12 @@ impl SplunkSource {
                         if idx_ack.is_some() && channel.is_none() {
                             return Err(Rejection::from(ApiError::MissingChannel));
                         }
+
+                        let query_index_for_events = if auto_forward_metadata {
+                            query_index.clone()
+                        } else {
+                            None
+                        };
 
                         let mut data = Vec::new();
                         let (byte_size, body) = if gzip {
@@ -550,6 +557,7 @@ impl SplunkSource {
                         let iter: EventIterator<'_, StrRead<'_>> = EventIteratorGenerator {
                             deserializer: Deserializer::from_str(&body).into_iter::<JsonValue>(),
                             channel,
+                            query_index: query_index_for_events.clone(),
                             remote,
                             remote_addr,
                             batch,
@@ -575,6 +583,21 @@ impl SplunkSource {
 
                         for event in events.iter_mut() {
                             let log = event.as_mut_log();
+
+                            if let Some(ref index_val) = query_index_for_events {
+                                log_namespace.insert_source_metadata(
+                                    SplunkHecFullConfig::NAME,
+                                    log,
+                                    Some(LegacyKey::Overwrite(&owned_value_path!(INDEX))),
+                                    lookup::path!("index"),
+                                    index_val.clone(),
+                                );
+
+                                if auto_forward_metadata {
+                                    log.insert(event_path!("index"), Value::from(index_val.clone()));
+                                }
+                            }
+
                             log_namespace.insert_source_metadata(
                                 SplunkHecFullConfig::NAME,
                                 log,
@@ -1089,6 +1112,7 @@ struct EventIterator<'de, R: JsonRead<'de>> {
 struct EventIteratorGenerator<'de, R: JsonRead<'de>> {
     deserializer: serde_json::StreamDeserializer<'de, R, JsonValue>,
     channel: Option<String>,
+    query_index: Option<String>,
     batch: Option<BatchNotifier>,
     token: Option<Arc<str>>,
     store_hec_token: bool,
@@ -1117,7 +1141,12 @@ impl<'de, R: JsonRead<'de>> From<EventIteratorGenerator<'de, R>> for EventIterat
                         .map(Value::from),
                     f.log_namespace,
                 ),
-                DefaultExtractor::new("index", OptionalValuePath::new(INDEX), f.log_namespace),
+                DefaultExtractor::new_with(
+                    "index",
+                    OptionalValuePath::new(INDEX),
+                    f.query_index.map(Value::from),
+                    f.log_namespace,
+                ),
                 DefaultExtractor::new("source", OptionalValuePath::new(SOURCE), f.log_namespace),
                 DefaultExtractor::new(
                     "sourcetype",
@@ -2110,6 +2139,33 @@ mod tests {
         SocketAddr,
         PortGuard,
     ) {
+        source_with_full_opts_ns_auto(
+            token,
+            valid_tokens,
+            acknowledgements,
+            store_hec_token,
+            raw_require_channel,
+            raw_line_splitting,
+            log_namespace,
+            true,
+        )
+        .await
+    }
+
+    async fn source_with_full_opts_ns_auto(
+        token: Option<SensitiveString>,
+        valid_tokens: Option<&[&str]>,
+        acknowledgements: Option<HecAcknowledgementsConfig>,
+        store_hec_token: bool,
+        raw_require_channel: bool,
+        raw_line_splitting: bool,
+        log_namespace: Option<bool>,
+        auto_forward_metadata: bool,
+    ) -> (
+        impl Stream<Item = Event> + Unpin + use<>,
+        SocketAddr,
+        PortGuard,
+    ) {
         let (sender, recv) = SourceSender::new_test_finalize(EventStatus::Delivered);
         let (_guard, address) = next_addr();
         let valid_tokens =
@@ -2126,7 +2182,7 @@ mod tests {
                 log_namespace,
                 keepalive: Default::default(),
                 allow_query_string_auth: true,
-                auto_forward_metadata: true,
+                auto_forward_metadata,
                 fix_bare_string_events: true,
                 raw_require_channel,
                 raw_line_splitting,
@@ -2574,6 +2630,75 @@ mod tests {
                 .unwrap()
                 .to_string_lossy(),
             "raw"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_forward_metadata_defaults_disabled() {
+        let (source, address, _guard) = source_with_full_opts_ns_auto(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            Some(true),
+            SplunkHecFullConfig::default().auto_forward_metadata,
+        )
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector/event?index=foo"))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .header("x-splunk-request-channel", "ch1")
+            .body(r#"{"event":"auto forward default off"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let events = collect_n(source, 1).await;
+        let log = events[0].as_log();
+        assert!(log.get(event_path!("index")).is_none());
+        assert!(log.get(event_path!("splunk_index")).is_none());
+        assert!(
+            log.get(vrl::metadata_path!("splunk_hec_full", "index"))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_forward_metadata_enabled_injects_fields() {
+        let (source, address, _guard) = source_with_full_opts_ns_auto(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            Some(true),
+            true,
+        )
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector/event?index=foo"))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .header("x-splunk-request-channel", "ch1")
+            .body(r#"{"event":"auto forward on"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let events = collect_n(source, 1).await;
+        let log = events[0].as_log();
+        assert_eq!(log.get(event_path!("index")).unwrap().to_string_lossy(), "foo");
+        assert_eq!(
+            log.get(vrl::metadata_path!("splunk_hec_full", "index"))
+                .unwrap()
+                .to_string_lossy(),
+            "foo"
         );
     }
 
