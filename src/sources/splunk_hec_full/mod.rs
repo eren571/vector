@@ -1037,7 +1037,7 @@ impl SplunkSource {
                             )),
                             // Invalid token
                             (Some(_), false) => {
-                                Err(Rejection::from(ApiError::InvalidAuthorization))
+                                Err(Rejection::from(ApiError::InvalidToken))
                             }
                             // Missing token when required
                             (None, false) => Err(Rejection::from(ApiError::MissingAuthorization)),
@@ -1816,6 +1816,7 @@ impl vector_lib::internal_event::InternalEvent for SplunkHecRequestError {
 pub(crate) enum ApiError {
     MissingAuthorization,
     InvalidAuthorization,
+    InvalidToken,
     InternalError { message: &'static str },
     UnsupportedEncoding,
     UnsupportedContentType,
@@ -1841,6 +1842,7 @@ mod splunk_response {
         Success = 0,
         TokenIsRequired = 2,
         InvalidAuthorization = 3,
+        InvalidToken = 4,
         NoData = 5,
         InvalidDataFormat = 6,
         ServerIsBusy = 9,
@@ -1872,6 +1874,7 @@ mod splunk_response {
                 HecStatusCode::Success => "Success",
                 HecStatusCode::TokenIsRequired => "Token is required",
                 HecStatusCode::InvalidAuthorization => "Invalid authorization",
+                HecStatusCode::InvalidToken => "Invalid token",
                 HecStatusCode::NoData => "No data",
                 HecStatusCode::InvalidDataFormat => "Invalid data format",
                 HecStatusCode::DataChannelIsMissing => "Data channel is missing",
@@ -1896,6 +1899,7 @@ mod splunk_response {
 
     pub const INVALID_AUTHORIZATION: HecResponse =
         HecResponse::new(HecStatusCode::InvalidAuthorization);
+    pub const INVALID_TOKEN: HecResponse = HecResponse::new(HecStatusCode::InvalidToken);
     pub const TOKEN_IS_REQUIRED: HecResponse = HecResponse::new(HecStatusCode::TokenIsRequired);
     pub const NO_DATA: HecResponse = HecResponse::new(HecStatusCode::NoData);
     pub const SUCCESS: HecResponse = HecResponse::new(HecStatusCode::Success);
@@ -1932,6 +1936,9 @@ async fn finish_err(rejection: Rejection) -> Result<(Response,), Rejection> {
                 StatusCode::UNAUTHORIZED,
                 splunk_response::INVALID_AUTHORIZATION,
             ),
+            ApiError::InvalidToken => {
+                response_json(StatusCode::FORBIDDEN, splunk_response::INVALID_TOKEN)
+            }
             ApiError::InternalError { message } => {
                 response_plain(StatusCode::INTERNAL_SERVER_ERROR, message)
             }
@@ -2803,6 +2810,59 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn missing_auth_returns_401_code2() {
+        let (_source, address, _guard) = source().await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector/event"))
+            .header("x-splunk-request-channel", "ch")
+            .body(r#"{"event":"no auth"}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 401);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_token_returns_403_code4() {
+        let (_source, address, _guard) = source().await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector/event"))
+            .header("Authorization", "Splunk wrong-token")
+            .header("x-splunk-request-channel", "ch")
+            .body(r#"{"event":"bad token"}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 403);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], 4);
+    }
+
+    #[tokio::test]
+    async fn valid_token_returns_200() {
+        let (source, address, _guard) = source().await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector/event"))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .header("x-splunk-request-channel", "ch")
+            .body(r#"{"event":"good token"}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let events = collect_n(source, 1).await;
+        assert_eq!(events.len(), 1);
     }
 
     // === Improvement 1: Health endpoint tests ===
