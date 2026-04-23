@@ -165,7 +165,7 @@ pub struct SplunkHecFullConfig {
     /// Splunk HEC requires a channel for the raw endpoint, but some legacy
     /// clients may not send one. Set to `false` to accept raw events without a channel.
     /// When false, events without a channel will have an auto-generated channel ID.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     raw_require_channel: bool,
 
     /// Whether to split raw endpoint body by newlines into multiple events.
@@ -203,7 +203,7 @@ impl Default for SplunkHecFullConfig {
             allow_query_string_auth: false,
             auto_forward_metadata: true,
             fix_bare_string_events: true,
-            raw_require_channel: true,
+            raw_require_channel: false,
             raw_line_splitting: false,
         }
     }
@@ -2388,10 +2388,17 @@ mod tests {
 
     // === Improvement 2: Raw channel optional tests ===
 
-    // Test: Raw without channel when required returns 400
+    // Test: Raw endpoint without channel is accepted by default
     #[tokio::test]
-    async fn test_raw_without_channel_required() {
-        let (_source, address, _guard) = source().await; // raw_require_channel=true by default
+    async fn raw_endpoint_no_channel_accepts() {
+        let (source, address, _guard) = source_with_full(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            SplunkHecFullConfig::default().raw_require_channel,
+        )
+        .await;
         let resp = reqwest::Client::new()
             .post(format!("http://{address}/services/collector/raw"))
             .header("Authorization", format!("Splunk {TOKEN}"))
@@ -2399,12 +2406,15 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 400); // Missing channel
+        assert_eq!(resp.status(), 200);
+
+        let events = collect_n(source, 1).await;
+        assert_eq!(events.len(), 1);
     }
 
-    // Test: Raw without channel when optional succeeds
+    // Test: Raw endpoint auto-generates UUID channel in metadata
     #[tokio::test]
-    async fn test_raw_without_channel_optional() {
+    async fn raw_auto_generated_channel_in_metadata() {
         let (source, address, _guard) = source_with_full(
             Some(TOKEN.to_owned().into()),
             None,
@@ -2425,9 +2435,14 @@ mod tests {
 
         let events = collect_n(source, 1).await;
         assert_eq!(events.len(), 1);
-        // The event should have an auto-generated channel
+
         let log = events[0].as_log();
-        assert!(log.get("splunk_channel").is_some());
+        let channel = log
+            .get("splunk_channel")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(Uuid::parse_str(&channel).is_ok());
     }
 
     // === Improvement 3: Raw ?time= tests ===
