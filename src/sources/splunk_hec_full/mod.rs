@@ -553,7 +553,8 @@ impl SplunkSource {
                             remote,
                             remote_addr,
                             batch,
-                            token: token.filter(|_| store_hec_token).map(Into::into),
+                            token: token.map(Into::into),
+                            store_hec_token,
                             log_namespace,
                             events_received,
                             auto_forward_metadata,
@@ -784,6 +785,18 @@ impl SplunkSource {
                             }
 
                             if let Some(ref token_str) = token {
+                                let log = event.as_mut_log();
+                                log_namespace.insert_source_metadata(
+                                    SplunkHecFullConfig::NAME,
+                                    log,
+                                    Some(LegacyKey::Overwrite(&owned_value_path!(
+                                        "splunk_hec_full_meta",
+                                        "token"
+                                    ))),
+                                    lookup::path!("token"),
+                                    Value::from(token_str.clone()),
+                                );
+
                                 if store_hec_token {
                                     event.metadata_mut().set_splunk_hec_token(token_str.clone().into());
                                 }
@@ -1052,6 +1065,8 @@ struct EventIterator<'de, R: JsonRead<'de>> {
     batch: Option<BatchNotifier>,
     /// Splunk HEC Token for passthrough
     token: Option<Arc<str>>,
+    /// Whether to write token into event secrets metadata
+    store_hec_token: bool,
     /// Lognamespace to put the events in
     log_namespace: LogNamespace,
     /// handle to EventsReceived registry
@@ -1070,6 +1085,7 @@ struct EventIteratorGenerator<'de, R: JsonRead<'de>> {
     channel: Option<String>,
     batch: Option<BatchNotifier>,
     token: Option<Arc<str>>,
+    store_hec_token: bool,
     log_namespace: LogNamespace,
     events_received: Registered<EventsReceived>,
     remote: Option<SocketAddr>,
@@ -1105,6 +1121,7 @@ impl<'de, R: JsonRead<'de>> From<EventIteratorGenerator<'de, R>> for EventIterat
             ],
             batch: f.batch,
             token: f.token,
+            store_hec_token: f.store_hec_token,
             log_namespace: f.log_namespace,
             events_received: f.events_received,
             auto_forward_metadata: f.auto_forward_metadata,
@@ -1234,7 +1251,17 @@ impl<'de, R: JsonRead<'de>> EventIterator<'de, R> {
 
         // Add passthrough token if present
         if let Some(token) = &self.token {
-            log.metadata_mut().set_splunk_hec_token(Arc::clone(token));
+            self.log_namespace.insert_source_metadata(
+                SplunkHecFullConfig::NAME,
+                &mut log,
+                Some(LegacyKey::Overwrite(&owned_value_path!("splunk_hec_full_meta", "token"))),
+                lookup::path!("token"),
+                Value::from(token.as_ref()),
+            );
+
+            if self.store_hec_token {
+                log.metadata_mut().set_splunk_hec_token(Arc::clone(token));
+            }
         }
 
         // Write auto_extract_timestamp flag as event-level field for downstream sinks
@@ -2208,6 +2235,132 @@ mod tests {
         assert_eq!(
             log.metadata().splunk_hec_token().unwrap().as_ref(),
             "header-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_metadata_always_injected_when_store_hec_token_false() {
+        let (source, address, _guard) = source_with_full_opts_ns(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            Some(true),
+        )
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector/event"))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .header("x-splunk-request-channel", "ch1")
+            .body(r#"{"event":"token metadata false"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let events = collect_n(source, 1).await;
+        let log = events[0].as_log();
+        assert_eq!(
+            log.get(vrl::metadata_path!("splunk_hec_full", "token"))
+                .unwrap()
+                .to_string_lossy(),
+            TOKEN
+        );
+        assert!(log.metadata().splunk_hec_token().is_none());
+    }
+
+    #[tokio::test]
+    async fn token_metadata_always_injected_when_store_hec_token_true() {
+        let (source, address, _guard) = source_with_full_opts_ns(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            true,
+            false,
+            false,
+            Some(true),
+        )
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector/event"))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .header("x-splunk-request-channel", "ch1")
+            .body(r#"{"event":"token metadata true"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let events = collect_n(source, 1).await;
+        let log = events[0].as_log();
+        assert_eq!(
+            log.get(vrl::metadata_path!("splunk_hec_full", "token"))
+                .unwrap()
+                .to_string_lossy(),
+            TOKEN
+        );
+    }
+
+    #[tokio::test]
+    async fn token_secret_only_when_store_hec_token_true() {
+        let (source_false, address_false, _guard_false) = source_with_full_opts_ns(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            Some(true),
+        )
+        .await;
+
+        let resp_false = reqwest::Client::new()
+            .post(format!("http://{address_false}/services/collector/event"))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .header("x-splunk-request-channel", "ch1")
+            .body(r#"{"event":"secret false"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp_false.status(), 200);
+
+        let events_false = collect_n(source_false, 1).await;
+        assert!(events_false[0].as_log().metadata().splunk_hec_token().is_none());
+
+        let (source_true, address_true, _guard_true) = source_with_full_opts_ns(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            true,
+            false,
+            false,
+            Some(true),
+        )
+        .await;
+
+        let resp_true = reqwest::Client::new()
+            .post(format!("http://{address_true}/services/collector/event"))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .header("x-splunk-request-channel", "ch1")
+            .body(r#"{"event":"secret true"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp_true.status(), 200);
+
+        let events_true = collect_n(source_true, 1).await;
+        assert_eq!(
+            events_true[0]
+                .as_log()
+                .metadata()
+                .splunk_hec_token()
+                .unwrap()
+                .as_ref(),
+            TOKEN
         );
     }
 
