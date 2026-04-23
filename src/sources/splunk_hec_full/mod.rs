@@ -3620,4 +3620,94 @@ mod tests {
         assert!(msg.contains("line_A"), "Single event should contain all text");
         assert!(msg.contains("line_C"));
     }
+
+    #[tokio::test]
+    async fn paths_event() {
+        let (_source, address, _guard) = source().await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector/event"))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .header("x-splunk-request-channel", "ch1")
+            .body(r#"{"event":"alias event"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn paths_event_1_0() {
+        let (_source, address, _guard) = source().await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector/event/1.0"))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .header("x-splunk-request-channel", "ch1")
+            .body(r#"{"event":"alias event 1.0"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn paths_event_short() {
+        let (_source, address, _guard) = source().await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector"))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .header("x-splunk-request-channel", "ch1")
+            .body(r#"{"event":"alias short"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn paths_raw() {
+        let (_source, address, _guard) = source().await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector/raw?channel=ch1"))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .body("alias raw")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn paths_raw_1_0() {
+        let (_source, address, _guard) = source().await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector/raw/1.0?channel=ch1"))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .body("alias raw 1.0")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn paths_health() {
+        let (_source, address, _guard) = source().await;
+        let resp = reqwest::Client::new()
+            .get(format!("http://{address}/services/collector/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn paths_health_1_0() {
+        let (_source, address, _guard) = source().await;
+        let resp = reqwest::Client::new()
+            .get(format!("http://{address}/services/collector/health/1.0"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
 }
