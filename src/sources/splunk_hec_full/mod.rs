@@ -720,6 +720,12 @@ impl SplunkSource {
                             {
                                 let log = event.as_mut_log();
 
+                                if auto_forward_metadata && !log.value().is_object() {
+                                    return Err(Rejection::from(ApiError::InternalError {
+                                        message: "auto_forward_metadata requires object root; fix_bare_string_events disabled? See I10",
+                                    }));
+                                }
+
                                 if let Some(ref host_val) = final_host {
                                     log_namespace.insert_source_metadata(
                                         SplunkHecFullConfig::NAME,
@@ -1232,6 +1238,13 @@ impl<'de, R: JsonRead<'de>> EventIterator<'de, R> {
 
         // Auto-forward metadata as event-level fields (without splunk_ prefix)
         if self.auto_forward_metadata {
+            if !log.value().is_object() {
+                return Err(ApiError::InternalError {
+                    message: "auto_forward_metadata requires object root; fix_bare_string_events disabled? See I10",
+                }
+                .into());
+            }
+
             // index
             let index_val = self.extractors[1].value.clone();
             if let Some(val) = index_val {
@@ -1541,7 +1554,7 @@ fn raw_event(
         LogNamespace::Vector => {
             // Fix bare string events: wrap string values as {"message": "..."} instead of raw bytes
             // This prevents serialization issues where bare strings render as {"event":{}}
-            if fix_bare_string_events && message.is_bytes() {
+            if fix_bare_string_events && !message.is_object() {
                 let mut l = LogEvent::default();
                 l.insert(event_path!("message"), message);
                 l
@@ -1668,7 +1681,7 @@ fn raw_events_split(
 
         let mut log = match log_namespace {
             LogNamespace::Vector => {
-                if fix_bare_string_events && message.is_bytes() {
+                if fix_bare_string_events && !message.is_object() {
                     let mut l = LogEvent::default();
                     l.insert(event_path!("message"), message);
                     l
@@ -1774,6 +1787,7 @@ impl vector_lib::internal_event::InternalEvent for SplunkHecRequestError {
 pub(crate) enum ApiError {
     MissingAuthorization,
     InvalidAuthorization,
+    InternalError { message: &'static str },
     UnsupportedEncoding,
     UnsupportedContentType,
     MissingChannel,
@@ -1889,6 +1903,9 @@ async fn finish_err(rejection: Rejection) -> Result<(Response,), Rejection> {
                 StatusCode::UNAUTHORIZED,
                 splunk_response::INVALID_AUTHORIZATION,
             ),
+            ApiError::InternalError { message } => {
+                response_plain(StatusCode::INTERNAL_SERVER_ERROR, message)
+            }
             ApiError::UnsupportedEncoding => empty_response(StatusCode::UNSUPPORTED_MEDIA_TYPE),
             ApiError::UnsupportedContentType => response_plain(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -2893,7 +2910,7 @@ mod tests {
 
     // Test: Raw endpoint with URL metadata preserves raw text body
     #[tokio::test]
-    async fn test_raw_with_url_metadata_preserves_body() {
+    async fn raw_text_with_url_metadata_preserves_body() {
         let (source, address, _guard) = source_with_full(
             Some(TOKEN.to_owned().into()),
             None,
@@ -2963,8 +2980,17 @@ mod tests {
 
     // Test: Empty string event rejected (Splunk code 13)
     #[tokio::test]
-    async fn test_empty_string_event_rejected() {
-        let (_source, address, _guard) = source().await;
+    async fn empty_string_event_rejected() {
+        let (_source, address, _guard) = source_with_full_opts_ns(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            Some(true),
+        )
+        .await;
         let resp = send_req(
             address,
             "event",
@@ -2981,8 +3007,17 @@ mod tests {
 
     // Test: Empty object event rejected
     #[tokio::test]
-    async fn test_empty_object_event_rejected() {
-        let (_source, address, _guard) = source().await;
+    async fn empty_object_event_rejected() {
+        let (_source, address, _guard) = source_with_full_opts_ns(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            Some(true),
+        )
+        .await;
         let resp = send_req(
             address,
             "event",
@@ -3087,15 +3122,24 @@ mod tests {
 
     // Test: Integer event preserved (not corrupted by metadata)
     #[tokio::test]
-    async fn test_integer_event_preserved() {
-        let (source, address, _guard) = source().await;
+    async fn integer_event_preserved_with_url_metadata() {
+        let (source, address, _guard) = source_with_full_opts_ns(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            Some(true),
+        )
+        .await;
         let resp = send_req(
             address,
             "event",
-            r#"{"event": 42, "index": "test_idx", "sourcetype": "metric"}"#,
+            r#"{"event": 42}"#,
             TOKEN,
             Some("ch1"),
-            &[],
+            &[("index", "test_idx"), ("sourcetype", "metric")],
         )
         .await;
         assert_eq!(resp.status(), 200);
@@ -3105,21 +3149,28 @@ mod tests {
         // Integer should be wrapped in "message" field to prevent metadata corruption
         let msg = log.get("message").expect("Integer event should be wrapped in 'message' field");
         assert_eq!(msg, &Value::Integer(42), "Integer value should be preserved as 42");
-        // Metadata should also be present
-        assert!(log.get("index").is_some(), "index metadata should be present");
     }
 
     // Test: Float event preserved
     #[tokio::test]
-    async fn test_float_event_preserved() {
-        let (source, address, _guard) = source().await;
+    async fn float_event_preserved_with_url_metadata() {
+        let (source, address, _guard) = source_with_full_opts_ns(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            Some(true),
+        )
+        .await;
         let resp = send_req(
             address,
             "event",
-            r#"{"event": 3.14, "index": "metrics"}"#,
+            r#"{"event": 3.14}"#,
             TOKEN,
             Some("ch1"),
-            &[],
+            &[("index", "metrics")],
         )
         .await;
         assert_eq!(resp.status(), 200);
@@ -3136,15 +3187,24 @@ mod tests {
 
     // Test: Boolean event preserved
     #[tokio::test]
-    async fn test_boolean_event_preserved() {
-        let (source, address, _guard) = source().await;
+    async fn boolean_event_preserved_with_url_metadata() {
+        let (source, address, _guard) = source_with_full_opts_ns(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            Some(true),
+        )
+        .await;
         let resp = send_req(
             address,
             "event",
-            r#"{"event": true, "index": "flags"}"#,
+            r#"{"event": true}"#,
             TOKEN,
             Some("ch1"),
-            &[],
+            &[("index", "flags")],
         )
         .await;
         assert_eq!(resp.status(), 200);
@@ -3157,15 +3217,24 @@ mod tests {
 
     // Test: Array event preserved
     #[tokio::test]
-    async fn test_array_event_preserved() {
-        let (source, address, _guard) = source().await;
+    async fn array_event_preserved_with_url_metadata() {
+        let (source, address, _guard) = source_with_full_opts_ns(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            Some(true),
+        )
+        .await;
         let resp = send_req(
             address,
             "event",
-            r#"{"event": [1, "two", 3.0], "index": "arrays"}"#,
+            r#"{"event": [1, "two", 3.0]}"#,
             TOKEN,
             Some("ch1"),
-            &[],
+            &[("index", "arrays")],
         )
         .await;
         assert_eq!(resp.status(), 200);
@@ -3178,8 +3247,17 @@ mod tests {
 
     // Test: Null event rejected
     #[tokio::test]
-    async fn test_null_event_rejected() {
-        let (_source, address, _guard) = source().await;
+    async fn null_event_rejected() {
+        let (_source, address, _guard) = source_with_full_opts_ns(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            Some(true),
+        )
+        .await;
         let resp = send_req(
             address,
             "event",
@@ -3196,8 +3274,17 @@ mod tests {
 
     // Test: Empty array event rejected
     #[tokio::test]
-    async fn test_empty_array_event_rejected() {
-        let (_source, address, _guard) = source().await;
+    async fn empty_array_event_rejected() {
+        let (_source, address, _guard) = source_with_full_opts_ns(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            Some(true),
+        )
+        .await;
         let resp = send_req(
             address,
             "event",
