@@ -138,9 +138,9 @@ pub struct SplunkHecFullConfig {
     ///
     /// When enabled, clients can pass the HEC token as a URL query parameter
     /// instead of (or in addition to) the `Authorization` header.
-    /// URL token takes precedence over the header token when both are present.
-    /// This matches Splunk's `allowQueryStringAuth` behavior.
-    #[serde(default = "default_true")]
+    /// Header token takes precedence over URL token when both are present.
+    /// URL token is only used when the header is missing.
+    #[serde(default = "default_false")]
     allow_query_string_auth: bool,
 
     /// Automatically write metadata fields (index, sourcetype, source) as
@@ -183,6 +183,10 @@ const fn default_true() -> bool {
     true
 }
 
+const fn default_false() -> bool {
+    false
+}
+
 impl_generate_config_from_default!(SplunkHecFullConfig);
 
 impl Default for SplunkHecFullConfig {
@@ -196,7 +200,7 @@ impl Default for SplunkHecFullConfig {
             store_hec_token: false,
             log_namespace: None,
             keepalive: Default::default(),
-            allow_query_string_auth: true,
+            allow_query_string_auth: false,
             auto_forward_metadata: true,
             fix_bare_string_events: true,
             raw_require_channel: true,
@@ -926,9 +930,10 @@ impl SplunkSource {
                     let valid_credentials = valid_credentials.clone();
                     async move {
                         // Determine effective token:
-                        // If allow_query_string_auth is enabled, URL token takes precedence
+                        // If allow_query_string_auth is enabled, header takes precedence.
                         let token = if allow_query_string_auth {
-                            url_token.map(|t| format!("Splunk {}", t)).or(header_token)
+                            header_token
+                                .or_else(|| url_token.map(|t| format!("Splunk {}", t)))
                         } else {
                             header_token
                         };
@@ -1913,6 +1918,27 @@ mod tests {
         SocketAddr,
         PortGuard,
     ) {
+        source_with_query_auth(
+            token,
+            valid_tokens,
+            acknowledgements,
+            store_hec_token,
+            true,
+        )
+        .await
+    }
+
+    async fn source_with_query_auth(
+        token: Option<SensitiveString>,
+        valid_tokens: Option<&[&str]>,
+        acknowledgements: Option<HecAcknowledgementsConfig>,
+        store_hec_token: bool,
+        allow_query_string_auth: bool,
+    ) -> (
+        impl Stream<Item = Event> + Unpin + use<>,
+        SocketAddr,
+        PortGuard,
+    ) {
         let (sender, recv) = SourceSender::new_test_finalize(EventStatus::Delivered);
         let (_guard, address) = next_addr();
         let valid_tokens =
@@ -1928,7 +1954,7 @@ mod tests {
                 store_hec_token,
                 log_namespace: None,
                 keepalive: Default::default(),
-                allow_query_string_auth: true,
+                allow_query_string_auth,
                 auto_forward_metadata: true,
                 fix_bare_string_events: true,
                 raw_require_channel: true,
@@ -2043,12 +2069,46 @@ mod tests {
         builder.send().await.unwrap()
     }
 
-    // Test: URL token authentication works
+    // Test: URL token defaults disabled
     #[tokio::test]
-    async fn test_url_token_auth() {
-        let (source, address, _guard) = source().await;
+    async fn url_token_defaults_disabled() {
+        let (source, address, _guard) = source_with_query_auth(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            SplunkHecFullConfig::default().allow_query_string_auth,
+        )
+        .await;
 
-        // Send with URL token instead of header
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://{address}/services/collector/event?token={TOKEN}"
+            ))
+            .header("x-splunk-request-channel", "test-channel")
+            .body(r#"{"event":"hello via url token"}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 401);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], 2);
+        drop(source);
+    }
+
+    // Test: URL token is accepted when query auth is enabled and header is missing
+    #[tokio::test]
+    async fn url_used_when_header_missing() {
+        let (source, address, _guard) = source_with_query_auth(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            true,
+        )
+        .await;
+
         let resp = reqwest::Client::new()
             .post(format!(
                 "http://{address}/services/collector/event?token={TOKEN}"
@@ -2065,21 +2125,21 @@ mod tests {
         assert_eq!(events.len(), 1);
     }
 
-    // Test: URL token takes precedence over header
+    // Test: Header token takes precedence over URL token when query auth is enabled
     #[tokio::test]
-    async fn test_url_token_precedence() {
-        let (source, address, _guard) = source_with(
+    async fn header_priority_over_url_when_enabled() {
+        let (source, address, _guard) = source_with_query_auth(
             None,
             Some(&["url-token", "header-token"]),
             None,
             true,
+            true,
         )
         .await;
 
-        // Send with both header and URL token
         let resp = reqwest::Client::new()
             .post(format!(
-                "http://{address}/services/collector/event?token=url-token"
+                "http://{address}/services/collector/event?token=wrong-token"
             ))
             .header("Authorization", "Splunk header-token")
             .header("x-splunk-request-channel", "test-channel")
@@ -2092,29 +2152,38 @@ mod tests {
 
         let events = collect_n(source, 1).await;
         let log = events[0].as_log();
-        // The stored token should be the URL token (which takes precedence)
+        // The stored token should be the header token (header has precedence)
         assert_eq!(
             log.metadata().splunk_hec_token().unwrap().as_ref(),
-            "url-token"
+            "header-token"
         );
     }
 
-    // Test: Invalid URL token is rejected
+    // Test: URL token is ignored when query auth is disabled
     #[tokio::test]
-    async fn test_invalid_url_token_rejected() {
-        let (_source, address, _guard) = source().await;
+    async fn url_ignored_when_disabled() {
+        let (_source, address, _guard) = source_with_query_auth(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            false,
+        )
+        .await;
 
         let resp = reqwest::Client::new()
             .post(format!(
-                "http://{address}/services/collector/event?token=invalid-token"
+                "http://{address}/services/collector/event?token={TOKEN}"
             ))
             .header("x-splunk-request-channel", "test-channel")
-            .body(r#"{"event":"should fail"}"#)
+            .body(r#"{"event":"url token ignored"}"#)
             .send()
             .await
             .unwrap();
 
         assert_eq!(resp.status(), 401);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], 2);
     }
 
     // Test: Raw endpoint with URL metadata parameters
