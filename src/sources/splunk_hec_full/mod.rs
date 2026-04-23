@@ -3272,7 +3272,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 401);
+        assert_eq!(resp.status(), 403);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], 4);
     }
 
     // Test: Batch of mixed string and object events
@@ -3486,25 +3488,15 @@ mod tests {
 
     // Test: Batch with mixed data types all preserve values
     #[tokio::test]
-    async fn test_batch_all_types_preserved() {
+    async fn test_batch_mixed_types_with_bool_rejected_whole_batch() {
         let (source, address, _guard) = source().await;
         let batch = r#"{"event":"string val"}{"event":42}{"event":true}{"event":{"k":"v"}}{"event":[1,2]}"#;
         let resp = send_req(address, "event", batch, TOKEN, Some("ch1"), &[]).await;
-        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], 6);
 
-        let events = collect_n(source, 5).await;
-        assert_eq!(events.len(), 5, "All 5 batch events should be received");
-
-        // String -> message
-        assert!(events[0].as_log().get("message").is_some());
-        // Integer -> message
-        assert_eq!(events[1].as_log().get("message").unwrap(), &Value::Integer(42));
-        // Boolean -> message
-        assert_eq!(events[2].as_log().get("message").unwrap(), &Value::Boolean(true));
-        // Object -> keys at root
-        assert_eq!(events[3].as_log().get("k").unwrap().to_string_lossy(), "v");
-        // Array -> message
-        assert!(events[4].as_log().get("message").unwrap().is_array());
+        drop(source);
     }
 
     // Test: Raw line splitting splits multiline body into separate events
