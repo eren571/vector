@@ -743,7 +743,13 @@ impl SplunkSource {
                             {
                                 let log = event.as_mut_log();
 
-                                if auto_forward_metadata && !log.value().is_object() {
+                                let needs_event_field_insertion = auto_forward_metadata
+                                    && (final_host.is_some()
+                                        || final_index.is_some()
+                                        || final_sourcetype.is_some()
+                                        || final_source.is_some());
+
+                                if needs_event_field_insertion && !log.value().is_object() {
                                     return Err(Rejection::from(ApiError::InternalError {
                                         message: "auto_forward_metadata requires object root; fix_bare_string_events disabled? See I10",
                                     }));
@@ -1558,7 +1564,7 @@ fn raw_event(
     batch: Option<BatchNotifier>,
     log_namespace: LogNamespace,
     events_received: &Registered<EventsReceived>,
-    fix_bare_string_events: bool,
+    _fix_bare_string_events: bool,
 ) -> Result<Event, Rejection> {
     // Process gzip
     let message: Value = if gzip {
@@ -1580,17 +1586,7 @@ fn raw_event(
 
     // Construct event
     let mut log = match log_namespace {
-        LogNamespace::Vector => {
-            // Fix bare string events: wrap string values as {"message": "..."} instead of raw bytes
-            // This prevents serialization issues where bare strings render as {"event":{}}
-            if fix_bare_string_events && !message.is_object() {
-                let mut l = LogEvent::default();
-                l.insert(event_path!("message"), message);
-                l
-            } else {
-                LogEvent::from(message)
-            }
-        }
+        LogNamespace::Vector => LogEvent::from(message),
         LogNamespace::Legacy => {
             let mut log = LogEvent::default();
             log.maybe_insert(log_schema().message_key_target_path(), message);
@@ -1709,15 +1705,7 @@ fn raw_events_split(
         let message: Value = Value::from(Bytes::from(line.to_owned()));
 
         let mut log = match log_namespace {
-            LogNamespace::Vector => {
-                if fix_bare_string_events && !message.is_object() {
-                    let mut l = LogEvent::default();
-                    l.insert(event_path!("message"), message);
-                    l
-                } else {
-                    LogEvent::from(message)
-                }
-            }
+            LogNamespace::Vector => LogEvent::from(message),
             LogNamespace::Legacy => {
                 let mut l = LogEvent::default();
                 l.maybe_insert(log_schema().message_key_target_path(), message);
@@ -2606,6 +2594,26 @@ mod tests {
                 .to_string_lossy(),
             "raw"
         );
+    }
+
+    #[tokio::test]
+    async fn raw_endpoint_vector_namespace_root_is_string() {
+        let (source, address, _guard) = source_with_full_opts_ns(Some(TOKEN.to_owned().into()), None, None, false, false, false, Some(true)).await;
+        assert_eq!(send_req(address, "raw?channel=ch1", "raw-body-test-string", TOKEN, None, &[]).await.status(), 200);
+        let log = collect_n(source, 1).await.remove(0).into_log();
+        assert!(log.get(event_path!("message")).is_none());
+        assert!(!log.value().is_object());
+        assert_eq!(log.value().to_string_lossy(), "raw-body-test-string");
+    }
+
+    #[tokio::test]
+    async fn raw_endpoint_vector_namespace_metadata_preserved() {
+        let (source, address, _guard) = source_with_full_opts_ns(Some(TOKEN.to_owned().into()), None, None, false, false, false, Some(true)).await;
+        assert_eq!(send_req(address, "raw?channel=ch-test-meta", "raw-body-for-metadata", TOKEN, None, &[]).await.status(), 200);
+        let log = collect_n(source, 1).await.remove(0).into_log();
+        assert_eq!(log.get(vrl::metadata_path!("splunk_hec_full", "endpoint")).unwrap().to_string_lossy(), "raw");
+        assert_eq!(log.get(vrl::metadata_path!("splunk_hec_full", "splunk_channel")).unwrap().to_string_lossy(), "ch-test-meta");
+        assert_eq!(log.get(vrl::metadata_path!("splunk_hec_full", "token")).unwrap().to_string_lossy(), TOKEN);
     }
 
     #[tokio::test]
