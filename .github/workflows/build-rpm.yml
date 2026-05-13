@@ -2,7 +2,7 @@ name: Build Vector RPM
 
 on:
   push:
-    branches: [ prod-v0.54.0 ]
+    branches: [ prod-v0.55.0 ]
   workflow_dispatch:
 
 env:
@@ -71,7 +71,7 @@ jobs:
           # 运行 fpm (注意：反斜杠后面不要有任何空格或注释)
           fpm -s dir -t rpm \
             -n "vector-custom" \
-            -v "0.54.0" \
+            -v "0.55.0" \
             --architecture x86_64 \
             --description "Vector with Splunk HEC Full plugin" \
             -C target/package .
