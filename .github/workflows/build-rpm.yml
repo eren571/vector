@@ -39,7 +39,7 @@ jobs:
             cyrus-sasl-devel \
             libzstd-devel \
             clang-devel \
-            perl-FindBin \
+            perl-core \
             ruby \
             ruby-devel \
             rubygems \
