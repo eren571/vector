@@ -44,8 +44,8 @@ jobs:
             rubygems \
             rpm-build \
             rpm \
-            unzip \
-            curl
+            unzip
+          curl --version
           gem install --no-document fpm
 
       - name: Install protoc
