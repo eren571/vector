@@ -16,38 +16,51 @@ env:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    container:
+      image: amazonlinux:2023
     steps:
+      - name: Install Checkout Dependencies
+        run: |
+          dnf install -y git tar gzip
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Install System Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libssl-dev \
-            pkg-config \
+          dnf install -y \
+            gcc \
+            gcc-c++ \
+            make \
             cmake \
-            build-essential \
-            libsasl2-dev \
-            libzstd-dev \
-            libclang-dev \
-            ruby ruby-dev rubygems rpm \
-            unzip
-          sudo gem install --no-document fpm
+            openssl-devel \
+            pkgconf-pkg-config \
+            cyrus-sasl-devel \
+            libzstd-devel \
+            clang-devel \
+            ruby \
+            ruby-devel \
+            rubygems \
+            rpm-build \
+            rpm \
+            unzip \
+            curl
+          gem install --no-document fpm
 
       - name: Install protoc
         run: |
           PROTOC_VERSION="25.3"
           curl -Lo /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
-          sudo unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
-          sudo chmod +x /usr/local/bin/protoc
+          unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          chmod +x /usr/local/bin/protoc
           protoc --version
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-gnu
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable --target x86_64-unknown-linux-gnu
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
@@ -73,6 +86,7 @@ jobs:
             -n "vector-custom" \
             -v "0.55.0" \
             --architecture x86_64 \
+            --depends "cyrus-sasl-lib" \
             --description "Vector with Splunk HEC Full plugin" \
             -C target/package .
 
@@ -101,6 +115,10 @@ jobs:
         run: |
           # 检查依赖并安装
           yum install -y ./vector-custom-*.rpm
+          ldd /usr/bin/vector
+          if ldd /usr/bin/vector | grep -q "not found"; then
+            exit 1
+          fi
           # 核心验证：运行一次 help 看动态链接库是否都找得到
           vector --version
           vector help
