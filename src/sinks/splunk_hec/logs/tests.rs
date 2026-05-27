@@ -154,6 +154,56 @@ fn splunk_process_log_event() {
     assert!(metadata.fields.contains("event_field2"));
 }
 
+#[test]
+fn splunk_metadata_templates_can_use_splunk_hec_full_metadata() {
+    let mut log = LogEvent::default();
+    log.insert(event_path!("message"), "from splunk_hec_full");
+    log.insert(metadata_path!("splunk_hec_full", "host"), "hec-host");
+    log.insert(metadata_path!("splunk_hec_full", "index"), "hec-index");
+    log.insert(metadata_path!("splunk_hec_full", "source"), "hec-source");
+    log.insert(
+        metadata_path!("splunk_hec_full", "sourcetype"),
+        "hec-sourcetype",
+    );
+
+    let sourcetype = Template::try_from("{{ %splunk_hec_full.sourcetype }}".to_string()).ok();
+    let source = Template::try_from("{{ %splunk_hec_full.source }}".to_string()).ok();
+    let index = Template::try_from("{{ %splunk_hec_full.index }}".to_string()).ok();
+
+    let processed_event = process_log(
+        Event::Log(log),
+        &super::sink::HecLogData {
+            sourcetype: sourcetype.as_ref(),
+            source: source.as_ref(),
+            index: index.as_ref(),
+            host_key: Some(OptionalTargetPath {
+                path: Some(OwnedTargetPath::metadata(owned_value_path!(
+                    "splunk_hec_full",
+                    "host"
+                ))),
+            }),
+            indexed_fields: &[],
+            timestamp_nanos_key: None,
+            timestamp_key: None,
+            endpoint_target: EndpointTarget::Event,
+            auto_extract_timestamp: false,
+        },
+    );
+
+    let metadata = &processed_event.metadata;
+    assert_eq!(metadata.host, Some(Value::from("hec-host")));
+    assert_eq!(metadata.index, Some("hec-index".to_string()));
+    assert_eq!(metadata.source, Some("hec-source".to_string()));
+    assert_eq!(metadata.sourcetype, Some("hec-sourcetype".to_string()));
+
+    let hec_data =
+        get_encoded_event::<HecEventJson>(JsonSerializerConfig::default().into(), processed_event);
+    assert_eq!(hec_data.host, Some("hec-host".to_string()));
+    assert_eq!(hec_data.index, Some("hec-index".to_string()));
+    assert_eq!(hec_data.source, Some("hec-source".to_string()));
+    assert_eq!(hec_data.sourcetype, Some("hec-sourcetype".to_string()));
+}
+
 fn hec_encoder(encoding: EncodingConfig) -> HecLogsEncoder {
     let transformer = encoding.transformer();
     let serializer = encoding.build().unwrap();

@@ -30,7 +30,7 @@ use vector_lib::{
     configurable::configurable_component,
     event::BatchNotifier,
     internal_event::{CountByteSize, InternalEventHandle as _, Registered},
-    lookup::{self, event_path, lookup_v2::OptionalValuePath, owned_value_path},
+    lookup::{self, event_path, owned_value_path},
     schema::meaning,
     sensitive_string::SensitiveString,
     source_sender::SendError,
@@ -143,12 +143,14 @@ pub struct SplunkHecFullConfig {
     #[serde(default = "default_false")]
     allow_query_string_auth: bool,
 
-    /// Automatically write metadata fields (index, sourcetype, source) as
-    /// event-level fields without the `splunk_` prefix, in addition to the
-    /// standard prefixed fields.
+    /// Legacy compatibility option that copies HEC metadata fields (`index`,
+    /// `sourcetype`, `source`, and `host`) into ordinary event fields.
     ///
-    /// This enables zero-config transparent forwarding to a `splunk_hec_logs` sink
-    /// when the sink uses templates like `index: "{{ index }}"`.
+    /// This can mutate transparent payloads. Prefer reading source metadata
+    /// directly from downstream templates such as
+    /// `index: "{{ %splunk_hec_full.index }}"`,
+    /// `source: "{{ %splunk_hec_full.source }}"`, and
+    /// `sourcetype: "{{ %splunk_hec_full.sourcetype }}"`.
     #[serde(default = "default_false")]
     auto_forward_metadata: bool,
 
@@ -171,8 +173,9 @@ pub struct SplunkHecFullConfig {
     /// Whether to split raw endpoint body by newlines into multiple events.
     ///
     /// When enabled, raw endpoint requests with multiline bodies are split
-    /// by newline characters (`\n`) into separate events, matching Splunk's
-    /// LINE_BREAKER behavior. Empty lines are skipped.
+    /// by newline characters (`\n`) into separate events. Empty lines are
+    /// skipped. This is newline-delimited raw handling, not a full Splunk
+    /// `LINE_BREAKER` implementation.
     ///
     /// When disabled (default), the entire raw body is treated as a single event.
     #[serde(default)]
@@ -383,9 +386,7 @@ struct HealthQueryParams {
 impl HealthQueryParams {
     /// Returns true if ack check is requested (?ack=true or ?ack=1)
     fn ack_enabled(&self) -> bool {
-        self.ack
-            .as_deref()
-            .is_some_and(|v| v == "true" || v == "1")
+        self.ack.as_deref().is_some_and(|v| v == "true" || v == "1")
     }
 }
 
@@ -464,20 +465,17 @@ impl SplunkSource {
     fn event_service(&self, out: SourceSender) -> BoxedFilter<(Response,)> {
         let splunk_channel_header = warp::header::optional::<String>(X_SPLUNK_REQUEST_CHANNEL);
 
-        let event_query_params =
-            warp::query::<EventQueryParams>().or_else(|_| async {
-                Ok::<(EventQueryParams,), Rejection>((EventQueryParams::default(),))
-            });
+        let event_query_params = warp::query::<EventQueryParams>().or_else(|_| async {
+            Ok::<(EventQueryParams,), Rejection>((EventQueryParams::default(),))
+        });
 
-        let splunk_channel = splunk_channel_header
-            .and(event_query_params)
-            .map(
-                |header: Option<String>, params: EventQueryParams| {
-                    let auto_extract_ts = params.auto_extract_timestamp_enabled();
-                    let channel = header.or(params.channel);
-                    (channel, auto_extract_ts, params.index)
-                },
-            );
+        let splunk_channel = splunk_channel_header.and(event_query_params).map(
+            |header: Option<String>, params: EventQueryParams| {
+                let auto_extract_ts = params.auto_extract_timestamp_enabled();
+                let channel = header.or(params.channel);
+                (channel, auto_extract_ts, params.index)
+            },
+        );
 
         let protocol = self.protocol;
         let idx_ack = self.idx_ack.clone();
@@ -503,7 +501,11 @@ impl SplunkSource {
             .and_then(
                 move |_,
                       token: Option<String>,
-                        (channel, auto_extract_ts, query_index): (Option<String>, bool, Option<String>),
+                      (channel, auto_extract_ts, query_index): (
+                    Option<String>,
+                    bool,
+                    Option<String>,
+                ),
                       remote: Option<SocketAddr>,
                       remote_addr: Option<String>,
                       gzip: bool,
@@ -583,31 +585,15 @@ impl SplunkSource {
 
                         for event in events.iter_mut() {
                             let log = event.as_mut_log();
-
-                            if let Some(ref index_val) = query_index_for_events {
-                                log_namespace.insert_source_metadata(
-                                    SplunkHecFullConfig::NAME,
-                                    log,
-                                    Some(LegacyKey::Overwrite(&owned_value_path!(INDEX))),
-                                    lookup::path!("index"),
-                                    index_val.clone(),
-                                );
-
-                                if auto_forward_metadata {
-                                    log.insert(event_path!("index"), Value::from(index_val.clone()));
-                                }
-                            }
-
-                            log_namespace.insert_source_metadata(
-                                SplunkHecFullConfig::NAME,
+                            insert_hec_metadata(
+                                log_namespace,
                                 log,
-                                Some(LegacyKey::Overwrite(&owned_value_path!(
-                                    "splunk_hec_full_meta",
-                                    "endpoint"
-                                ))),
-                                lookup::path!("endpoint"),
-                                Value::from("event"),
-                            );
+                                HecMetadata {
+                                    endpoint: Some(Value::from("event")),
+                                    ..Default::default()
+                                },
+                                false,
+                            )?;
                         }
 
                         if !events.is_empty() {
@@ -743,97 +729,37 @@ impl SplunkSource {
                             {
                                 let log = event.as_mut_log();
 
-                                let needs_event_field_insertion = auto_forward_metadata
-                                    && (final_host.is_some()
-                                        || final_index.is_some()
-                                        || final_sourcetype.is_some()
-                                        || final_source.is_some());
-
-                                if needs_event_field_insertion && !log.value().is_object() {
-                                    return Err(Rejection::from(ApiError::InternalError {
-                                        message: "auto_forward_metadata requires object root; fix_bare_string_events disabled? See I10",
-                                    }));
-                                }
-
-                                if let Some(ref host_val) = final_host {
-                                    log_namespace.insert_source_metadata(
-                                        SplunkHecFullConfig::NAME,
-                                        log,
-                                        log_schema().host_key().map(LegacyKey::InsertIfEmpty),
-                                        lookup::path!("host"),
-                                        host_val.clone(),
-                                    );
-                                    if auto_forward_metadata {
-                                        log.insert(event_path!("host"), Value::from(host_val.clone()));
-                                    }
-                                }
-
-                                if let Some(ref index_val) = final_index {
-                                    log_namespace.insert_source_metadata(
-                                        SplunkHecFullConfig::NAME,
-                                        log,
-                                        Some(LegacyKey::Overwrite(&owned_value_path!(INDEX))),
-                                        lookup::path!("index"),
-                                        index_val.clone(),
-                                    );
-                                    if auto_forward_metadata {
-                                        log.insert(event_path!("index"), Value::from(index_val.clone()));
-                                    }
-                                }
-
-                                if let Some(ref sourcetype_val) = final_sourcetype {
-                                    log_namespace.insert_source_metadata(
-                                        SplunkHecFullConfig::NAME,
-                                        log,
-                                        Some(LegacyKey::Overwrite(&owned_value_path!(SOURCETYPE))),
-                                        lookup::path!("sourcetype"),
-                                        sourcetype_val.clone(),
-                                    );
-                                    if auto_forward_metadata {
-                                        log.insert(event_path!("sourcetype"), Value::from(sourcetype_val.clone()));
-                                    }
-                                }
-
-                                if let Some(ref source_val) = final_source {
-                                    log_namespace.insert_source_metadata(
-                                        SplunkHecFullConfig::NAME,
-                                        log,
-                                        Some(LegacyKey::Overwrite(&owned_value_path!(SOURCE))),
-                                        lookup::path!("source"),
-                                        source_val.clone(),
-                                    );
-                                    if auto_forward_metadata {
-                                        log.insert(event_path!("source"), Value::from(source_val.clone()));
-                                    }
-                                }
-
-                                log_namespace.insert_source_metadata(
-                                    SplunkHecFullConfig::NAME,
+                                insert_hec_metadata(
+                                    log_namespace,
                                     log,
-                                    Some(LegacyKey::Overwrite(&owned_value_path!(
-                                        "splunk_hec_full_meta",
-                                        "endpoint"
-                                    ))),
-                                    lookup::path!("endpoint"),
-                                    Value::from("raw"),
-                                );
+                                    HecMetadata {
+                                        host: final_host.clone().map(Value::from),
+                                        index: final_index.clone().map(Value::from),
+                                        source: final_source.clone().map(Value::from),
+                                        sourcetype: final_sourcetype.clone().map(Value::from),
+                                        endpoint: Some(Value::from("raw")),
+                                        ..Default::default()
+                                    },
+                                    auto_forward_metadata,
+                                )?;
                             }
 
                             if let Some(ref token_str) = token {
                                 let log = event.as_mut_log();
-                                log_namespace.insert_source_metadata(
-                                    SplunkHecFullConfig::NAME,
+                                insert_hec_metadata(
+                                    log_namespace,
                                     log,
-                                    Some(LegacyKey::Overwrite(&owned_value_path!(
-                                        "splunk_hec_full_meta",
-                                        "token"
-                                    ))),
-                                    lookup::path!("token"),
-                                    Value::from(token_str.clone()),
-                                );
+                                    HecMetadata {
+                                        token: Some(Value::from(token_str.clone())),
+                                        ..Default::default()
+                                    },
+                                    false,
+                                )?;
 
                                 if store_hec_token {
-                                    event.metadata_mut().set_splunk_hec_token(token_str.clone().into());
+                                    event
+                                        .metadata_mut()
+                                        .set_splunk_hec_token(token_str.clone().into());
                                 }
                             }
 
@@ -843,24 +769,30 @@ impl SplunkSource {
                                 if let Ok(time_f64) = time_str.parse::<f64>() {
                                     let secs = time_f64.floor() as i64;
                                     let nsecs = ((time_f64.fract()) * 1_000_000_000.0) as u32;
-                                    if let Some(timestamp) = Utc.timestamp_opt(secs, nsecs).single() {
-                                        log_namespace.insert_source_metadata(
-                                            SplunkHecFullConfig::NAME,
+                                    if let Some(timestamp) = Utc.timestamp_opt(secs, nsecs).single()
+                                    {
+                                        insert_hec_metadata(
+                                            log_namespace,
                                             log,
-                                            log_schema().timestamp_key().map(LegacyKey::Overwrite),
-                                            lookup::path!("timestamp"),
-                                            timestamp,
-                                        );
+                                            HecMetadata {
+                                                timestamp: Some(Value::from(timestamp)),
+                                                ..Default::default()
+                                            },
+                                            false,
+                                        )?;
                                     }
                                 } else if let Ok(time_i64) = time_str.parse::<i64>()
-                                    && let Some(timestamp) = parse_timestamp(time_i64) {
-                                        log_namespace.insert_source_metadata(
-                                            SplunkHecFullConfig::NAME,
-                                            log,
-                                            log_schema().timestamp_key().map(LegacyKey::Overwrite),
-                                            lookup::path!("timestamp"),
-                                            timestamp,
-                                        );
+                                    && let Some(timestamp) = parse_timestamp(time_i64)
+                                {
+                                    insert_hec_metadata(
+                                        log_namespace,
+                                        log,
+                                        HecMetadata {
+                                            timestamp: Some(Value::from(timestamp)),
+                                            ..Default::default()
+                                        },
+                                        false,
+                                    )?;
                                 }
                             }
                         }
@@ -868,7 +800,9 @@ impl SplunkSource {
                         let res = out.send_batch(events).await;
                         match res {
                             Ok(()) => Ok(maybe_ack_id),
-                            Err(SendError::Closed) => Err(Rejection::from(ApiError::ServerShutdown)),
+                            Err(SendError::Closed) => {
+                                Err(Rejection::from(ApiError::ServerShutdown))
+                            }
                             Err(SendError::Timeout) => {
                                 unreachable!("No timeout is configured for this source.")
                             }
@@ -886,11 +820,9 @@ impl SplunkSource {
 
         warp::get()
             .and(path!("health" / "1.0").or(path!("health")))
-            .and(
-                warp::query::<HealthQueryParams>().or_else(|_| async {
-                    Ok::<(HealthQueryParams,), Rejection>((HealthQueryParams::default(),))
-                }),
-            )
+            .and(warp::query::<HealthQueryParams>().or_else(|_| async {
+                Ok::<(HealthQueryParams,), Rejection>((HealthQueryParams::default(),))
+            }))
             .map(move |_, params: HealthQueryParams| {
                 // 1. Token validation: if ?token= is provided, validate it
                 if let Some(token_val) = &params.token
@@ -1007,8 +939,7 @@ impl SplunkSource {
                         // Determine effective token:
                         // If allow_query_string_auth is enabled, header takes precedence.
                         let token = if allow_query_string_auth {
-                            header_token
-                                .or_else(|| url_token.map(|t| format!("Splunk {}", t)))
+                            header_token.or_else(|| url_token.map(|t| format!("Splunk {}", t)))
                         } else {
                             header_token
                         };
@@ -1018,12 +949,12 @@ impl SplunkSource {
                         let token = token.map(|t| {
                             if let Some(b64) = t.strip_prefix("Basic ") {
                                 use base64::prelude::{BASE64_STANDARD, Engine as _};
-                                if let Ok(decoded) = BASE64_STANDARD.decode(b64) {
-                                    if let Ok(s) = String::from_utf8(decoded) {
-                                        // Format: "x:token" or "username:token"
-                                        if let Some((_user, pass)) = s.split_once(':') {
-                                            return format!("Splunk {}", pass);
-                                        }
+                                if let Ok(decoded) = BASE64_STANDARD.decode(b64)
+                                    && let Ok(s) = String::from_utf8(decoded)
+                                {
+                                    // Format: "x:token" or "username:token"
+                                    if let Some((_user, pass)) = s.split_once(':') {
+                                        return format!("Splunk {}", pass);
                                     }
                                 }
                             }
@@ -1042,9 +973,7 @@ impl SplunkSource {
                                     .unwrap_or(token),
                             )),
                             // Invalid token
-                            (Some(_), false) => {
-                                Err(Rejection::from(ApiError::InvalidToken))
-                            }
+                            (Some(_), false) => Err(Rejection::from(ApiError::InvalidToken)),
                             // Missing token when required
                             (None, false) => Err(Rejection::from(ApiError::MissingAuthorization)),
                         }
@@ -1141,7 +1070,7 @@ impl<'de, R: JsonRead<'de>> From<EventIteratorGenerator<'de, R>> for EventIterat
             extractors: [
                 DefaultExtractor::new_with(
                     "host",
-                    log_schema().host_key().cloned().into(),
+                    HecMetadataField::Host,
                     f.remote_addr
                         .or_else(|| f.remote.map(|addr| addr.to_string()))
                         .map(Value::from),
@@ -1149,16 +1078,12 @@ impl<'de, R: JsonRead<'de>> From<EventIteratorGenerator<'de, R>> for EventIterat
                 ),
                 DefaultExtractor::new_with(
                     "index",
-                    OptionalValuePath::new(INDEX),
+                    HecMetadataField::Index,
                     f.query_index.map(Value::from),
                     f.log_namespace,
                 ),
-                DefaultExtractor::new("source", OptionalValuePath::new(SOURCE), f.log_namespace),
-                DefaultExtractor::new(
-                    "sourcetype",
-                    OptionalValuePath::new(SOURCETYPE),
-                    f.log_namespace,
-                ),
+                DefaultExtractor::new("source", HecMetadataField::Source, f.log_namespace),
+                DefaultExtractor::new("sourcetype", HecMetadataField::Sourcetype, f.log_namespace),
             ],
             batch: f.batch,
             token: f.token,
@@ -1189,21 +1114,18 @@ impl<'de, R: JsonRead<'de>> EventIterator<'de, R> {
         );
 
         // Process channel field
-        let channel_path = owned_value_path!(CHANNEL);
         if let Some(JsonValue::String(guid)) = json.get_mut("channel").map(JsonValue::take) {
-            self.log_namespace.insert_source_metadata(
-                SplunkHecFullConfig::NAME,
+            insert_hec_source_metadata(
+                self.log_namespace,
                 &mut log,
-                Some(LegacyKey::Overwrite(&channel_path)),
-                lookup::path!(CHANNEL),
-                guid,
+                HecMetadataField::Channel,
+                Value::from(guid),
             );
         } else if let Some(guid) = self.channel.as_ref() {
-            self.log_namespace.insert_source_metadata(
-                SplunkHecFullConfig::NAME,
+            insert_hec_source_metadata(
+                self.log_namespace,
                 &mut log,
-                Some(LegacyKey::Overwrite(&channel_path)),
-                lookup::path!(CHANNEL),
+                HecMetadataField::Channel,
                 guid.clone(),
             );
         }
@@ -1258,12 +1180,11 @@ impl<'de, R: JsonRead<'de>> EventIterator<'de, R> {
             Time::Now(time) => time,
         };
 
-        self.log_namespace.insert_source_metadata(
-            SplunkHecFullConfig::NAME,
+        insert_hec_source_metadata(
+            self.log_namespace,
             &mut log,
-            log_schema().timestamp_key().map(LegacyKey::Overwrite),
-            lookup::path!("timestamp"),
-            timestamp,
+            HecMetadataField::Timestamp,
+            Value::from(timestamp),
         );
 
         // Extract default extracted fields
@@ -1280,30 +1201,19 @@ impl<'de, R: JsonRead<'de>> EventIterator<'de, R> {
                 .into());
             }
 
-            // index
-            let index_val = self.extractors[1].value.clone();
-            if let Some(val) = index_val {
-                log.insert(event_path!("index"), val);
-            }
-            // source
-            let source_val = self.extractors[2].value.clone();
-            if let Some(val) = source_val {
-                log.insert(event_path!("source"), val);
-            }
-            // sourcetype
-            let sourcetype_val = self.extractors[3].value.clone();
-            if let Some(val) = sourcetype_val {
-                log.insert(event_path!("sourcetype"), val);
+            for extractor in &self.extractors {
+                if let Some(value) = extractor.value.clone() {
+                    insert_auto_forward_metadata_field(&mut log, extractor.metadata_field, value)?;
+                }
             }
         }
 
         // Add passthrough token if present
         if let Some(token) = &self.token {
-            self.log_namespace.insert_source_metadata(
-                SplunkHecFullConfig::NAME,
+            insert_hec_source_metadata(
+                self.log_namespace,
                 &mut log,
-                Some(LegacyKey::Overwrite(&owned_value_path!("splunk_hec_full_meta", "token"))),
-                lookup::path!("token"),
+                HecMetadataField::Token,
                 Value::from(token.as_ref()),
             );
 
@@ -1314,10 +1224,7 @@ impl<'de, R: JsonRead<'de>> EventIterator<'de, R> {
 
         // Write auto_extract_timestamp flag as event-level field for downstream sinks
         if self.auto_extract_timestamp {
-            log.insert(
-                event_path!("auto_extract_timestamp"),
-                Value::from(true),
-            );
+            log.insert(event_path!("auto_extract_timestamp"), Value::from(true));
         }
 
         if let Some(batch) = self.batch.clone() {
@@ -1342,22 +1249,22 @@ impl<'de, R: JsonRead<'de>> EventIterator<'de, R> {
                     return Err(ApiError::EmptyEventField { event: self.events }.into());
                 }
                 // Reject empty string events (Splunk returns code 13)
-                if let Some(s) = event.as_str() {
-                    if s.is_empty() {
-                        return Err(ApiError::EmptyEventField { event: self.events }.into());
-                    }
+                if let Some(s) = event.as_str()
+                    && s.is_empty()
+                {
+                    return Err(ApiError::EmptyEventField { event: self.events }.into());
                 }
                 // Reject empty object events
-                if let Some(obj) = event.as_object() {
-                    if obj.is_empty() {
-                        return Err(ApiError::EmptyEventField { event: self.events }.into());
-                    }
+                if let Some(obj) = event.as_object()
+                    && obj.is_empty()
+                {
+                    return Err(ApiError::EmptyEventField { event: self.events }.into());
                 }
                 // Reject empty array events
-                if let Some(arr) = event.as_array() {
-                    if arr.is_empty() {
-                        return Err(ApiError::EmptyEventField { event: self.events }.into());
-                    }
+                if let Some(arr) = event.as_array()
+                    && arr.is_empty()
+                {
+                    return Err(ApiError::EmptyEventField { event: self.events }.into());
                 }
 
                 let event: Value = event.into();
@@ -1487,10 +1394,163 @@ fn parse_timestamp(t: i64) -> Option<DateTime<Utc>> {
     Some(ts)
 }
 
+#[derive(Clone, Copy)]
+enum HecMetadataField {
+    Channel,
+    Host,
+    Index,
+    Source,
+    Sourcetype,
+    Endpoint,
+    Token,
+    Timestamp,
+}
+
+#[derive(Default)]
+struct HecMetadata {
+    channel: Option<Value>,
+    host: Option<Value>,
+    index: Option<Value>,
+    source: Option<Value>,
+    sourcetype: Option<Value>,
+    endpoint: Option<Value>,
+    token: Option<Value>,
+    timestamp: Option<Value>,
+}
+
+fn insert_hec_source_metadata(
+    log_namespace: LogNamespace,
+    log: &mut LogEvent,
+    field: HecMetadataField,
+    value: Value,
+) {
+    match field {
+        HecMetadataField::Channel => log_namespace.insert_source_metadata(
+            SplunkHecFullConfig::NAME,
+            log,
+            Some(LegacyKey::Overwrite(&owned_value_path!(CHANNEL))),
+            lookup::path!("channel"),
+            value,
+        ),
+        HecMetadataField::Host => log_namespace.insert_source_metadata(
+            SplunkHecFullConfig::NAME,
+            log,
+            log_schema().host_key().map(LegacyKey::InsertIfEmpty),
+            lookup::path!("host"),
+            value,
+        ),
+        HecMetadataField::Index => log_namespace.insert_source_metadata(
+            SplunkHecFullConfig::NAME,
+            log,
+            Some(LegacyKey::Overwrite(&owned_value_path!(INDEX))),
+            lookup::path!("index"),
+            value,
+        ),
+        HecMetadataField::Source => log_namespace.insert_source_metadata(
+            SplunkHecFullConfig::NAME,
+            log,
+            Some(LegacyKey::Overwrite(&owned_value_path!(SOURCE))),
+            lookup::path!("source"),
+            value,
+        ),
+        HecMetadataField::Sourcetype => log_namespace.insert_source_metadata(
+            SplunkHecFullConfig::NAME,
+            log,
+            Some(LegacyKey::Overwrite(&owned_value_path!(SOURCETYPE))),
+            lookup::path!("sourcetype"),
+            value,
+        ),
+        HecMetadataField::Endpoint => log_namespace.insert_source_metadata(
+            SplunkHecFullConfig::NAME,
+            log,
+            Some(LegacyKey::Overwrite(&owned_value_path!(
+                "splunk_hec_full_meta",
+                "endpoint"
+            ))),
+            lookup::path!("endpoint"),
+            value,
+        ),
+        HecMetadataField::Token => log_namespace.insert_source_metadata(
+            SplunkHecFullConfig::NAME,
+            log,
+            Some(LegacyKey::Overwrite(&owned_value_path!(
+                "splunk_hec_full_meta",
+                "token"
+            ))),
+            lookup::path!("token"),
+            value,
+        ),
+        HecMetadataField::Timestamp => log_namespace.insert_source_metadata(
+            SplunkHecFullConfig::NAME,
+            log,
+            log_schema().timestamp_key().map(LegacyKey::Overwrite),
+            lookup::path!("timestamp"),
+            value,
+        ),
+    }
+}
+
+fn insert_auto_forward_metadata_field(
+    log: &mut LogEvent,
+    field: HecMetadataField,
+    value: Value,
+) -> Result<(), Rejection> {
+    let target_path = match field {
+        HecMetadataField::Host => event_path!("host"),
+        HecMetadataField::Index => event_path!("index"),
+        HecMetadataField::Source => event_path!("source"),
+        HecMetadataField::Sourcetype => event_path!("sourcetype"),
+        HecMetadataField::Channel
+        | HecMetadataField::Endpoint
+        | HecMetadataField::Token
+        | HecMetadataField::Timestamp => return Ok(()),
+    };
+
+    if !log.value().is_object() {
+        return Err(ApiError::InternalError {
+            message: "auto_forward_metadata requires object root; fix_bare_string_events disabled? See I10",
+        }
+        .into());
+    }
+
+    log.insert(target_path, value);
+    Ok(())
+}
+
+fn insert_hec_metadata(
+    log_namespace: LogNamespace,
+    log: &mut LogEvent,
+    metadata: HecMetadata,
+    auto_forward_metadata: bool,
+) -> Result<(), Rejection> {
+    let fields = [
+        (HecMetadataField::Channel, metadata.channel),
+        (HecMetadataField::Host, metadata.host),
+        (HecMetadataField::Index, metadata.index),
+        (HecMetadataField::Source, metadata.source),
+        (HecMetadataField::Sourcetype, metadata.sourcetype),
+        (HecMetadataField::Endpoint, metadata.endpoint),
+        (HecMetadataField::Token, metadata.token),
+        (HecMetadataField::Timestamp, metadata.timestamp),
+    ];
+
+    for (field, value) in fields {
+        if let Some(value) = value {
+            insert_hec_source_metadata(log_namespace, log, field, value.clone());
+
+            if auto_forward_metadata {
+                insert_auto_forward_metadata_field(log, field, value)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Maintains last known extracted value of field and uses it in the absence of field.
 struct DefaultExtractor {
     field: &'static str,
-    to_field: OptionalValuePath,
+    metadata_field: HecMetadataField,
     value: Option<Value>,
     log_namespace: LogNamespace,
 }
@@ -1498,12 +1558,12 @@ struct DefaultExtractor {
 impl DefaultExtractor {
     const fn new(
         field: &'static str,
-        to_field: OptionalValuePath,
+        metadata_field: HecMetadataField,
         log_namespace: LogNamespace,
     ) -> Self {
         DefaultExtractor {
             field,
-            to_field,
+            metadata_field,
             value: None,
             log_namespace,
         }
@@ -1511,35 +1571,25 @@ impl DefaultExtractor {
 
     fn new_with(
         field: &'static str,
-        to_field: OptionalValuePath,
+        metadata_field: HecMetadataField,
         value: impl Into<Option<Value>>,
         log_namespace: LogNamespace,
     ) -> Self {
         DefaultExtractor {
             field,
-            to_field,
+            metadata_field,
             value: value.into(),
             log_namespace,
         }
     }
 
     fn extract(&mut self, log: &mut LogEvent, value: &mut JsonValue) {
-        // Process json_field
         if let Some(JsonValue::String(new_value)) = value.get_mut(self.field).map(JsonValue::take) {
             self.value = Some(new_value.into());
         }
 
-        // Add data field
-        if let Some(index) = self.value.as_ref()
-            && let Some(metadata_key) = self.to_field.path.as_ref()
-        {
-            self.log_namespace.insert_source_metadata(
-                SplunkHecFullConfig::NAME,
-                log,
-                Some(LegacyKey::Overwrite(metadata_key)),
-                &self.to_field.path.clone().unwrap_or(owned_value_path!("")),
-                index.clone(),
-            )
+        if let Some(value) = self.value.as_ref() {
+            insert_hec_source_metadata(self.log_namespace, log, self.metadata_field, value.clone());
         }
     }
 }
@@ -1597,12 +1647,11 @@ fn raw_event(
     events_received.emit(CountByteSize(1, log.estimated_json_encoded_size_of()));
 
     // Add channel
-    log_namespace.insert_source_metadata(
-        SplunkHecFullConfig::NAME,
+    insert_hec_source_metadata(
+        log_namespace,
         &mut log,
-        Some(LegacyKey::Overwrite(&owned_value_path!(CHANNEL))),
-        lookup::path!(CHANNEL),
-        channel,
+        HecMetadataField::Channel,
+        Value::from(channel),
     );
 
     // host-field priority for raw endpoint:
@@ -1615,12 +1664,11 @@ fn raw_event(
     };
 
     if let Some(host) = host {
-        log_namespace.insert_source_metadata(
-            SplunkHecFullConfig::NAME,
+        insert_hec_source_metadata(
+            log_namespace,
             &mut log,
-            log_schema().host_key().map(LegacyKey::InsertIfEmpty),
-            lookup::path!("host"),
-            host,
+            HecMetadataField::Host,
+            Value::from(host),
         );
     }
 
@@ -1638,7 +1686,7 @@ fn raw_event(
 }
 
 /// Creates multiple events from raw request by splitting on newlines.
-/// Each non-empty line becomes a separate event, matching Splunk's LINE_BREAKER behavior.
+/// Each non-empty line becomes a separate event.
 #[allow(clippy::too_many_arguments)]
 fn raw_events_split(
     bytes: Bytes,
@@ -1716,21 +1764,19 @@ fn raw_events_split(
         events_received.emit(CountByteSize(1, log.estimated_json_encoded_size_of()));
 
         // Add channel (same for all lines in this request)
-        log_namespace.insert_source_metadata(
-            SplunkHecFullConfig::NAME,
+        insert_hec_source_metadata(
+            log_namespace,
             &mut log,
-            Some(LegacyKey::Overwrite(&owned_value_path!(CHANNEL))),
-            lookup::path!(CHANNEL),
-            channel.clone(),
+            HecMetadataField::Channel,
+            Value::from(channel.clone()),
         );
 
         if let Some(ref host) = host {
-            log_namespace.insert_source_metadata(
-                SplunkHecFullConfig::NAME,
+            insert_hec_source_metadata(
+                log_namespace,
                 &mut log,
-                log_schema().host_key().map(LegacyKey::InsertIfEmpty),
-                lookup::path!("host"),
-                host.clone(),
+                HecMetadataField::Host,
+                Value::from(host.clone()),
             );
         }
 
@@ -2013,14 +2059,7 @@ mod tests {
         SocketAddr,
         PortGuard,
     ) {
-        source_with_query_auth(
-            token,
-            valid_tokens,
-            acknowledgements,
-            store_hec_token,
-            true,
-        )
-        .await
+        source_with_query_auth(token, valid_tokens, acknowledgements, store_hec_token, true).await
     }
 
     async fn source_with_query_auth(
@@ -2066,13 +2105,7 @@ mod tests {
     }
 
     async fn source() -> (impl Stream<Item = Event> + Unpin, SocketAddr, PortGuard) {
-        source_with(
-            Some(TOKEN.to_owned().into()),
-            None,
-            None,
-            false,
-        )
-        .await
+        source_with(Some(TOKEN.to_owned().into()), None, None, false).await
     }
 
     async fn source_with_full(
@@ -2147,6 +2180,7 @@ mod tests {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn source_with_full_opts_ns_auto(
         token: Option<SensitiveString>,
         valid_tokens: Option<&[&str]>,
@@ -2247,14 +2281,8 @@ mod tests {
     // Test: URL token is accepted when query auth is enabled and header is missing
     #[tokio::test]
     async fn url_used_when_header_missing() {
-        let (source, address, _guard) = source_with_query_auth(
-            Some(TOKEN.to_owned().into()),
-            None,
-            None,
-            false,
-            true,
-        )
-        .await;
+        let (source, address, _guard) =
+            source_with_query_auth(Some(TOKEN.to_owned().into()), None, None, false, true).await;
 
         let resp = reqwest::Client::new()
             .post(format!(
@@ -2275,14 +2303,9 @@ mod tests {
     // Test: Header token takes precedence over URL token when query auth is enabled
     #[tokio::test]
     async fn header_priority_over_url_when_enabled() {
-        let (source, address, _guard) = source_with_query_auth(
-            None,
-            Some(&["url-token", "header-token"]),
-            None,
-            true,
-            true,
-        )
-        .await;
+        let (source, address, _guard) =
+            source_with_query_auth(None, Some(&["url-token", "header-token"]), None, true, true)
+                .await;
 
         let resp = reqwest::Client::new()
             .post(format!(
@@ -2397,7 +2420,13 @@ mod tests {
         assert_eq!(resp_false.status(), 200);
 
         let events_false = collect_n(source_false, 1).await;
-        assert!(events_false[0].as_log().metadata().splunk_hec_token().is_none());
+        assert!(
+            events_false[0]
+                .as_log()
+                .metadata()
+                .splunk_hec_token()
+                .is_none()
+        );
 
         let (source_true, address_true, _guard_true) = source_with_full_opts_ns(
             Some(TOKEN.to_owned().into()),
@@ -2435,14 +2464,8 @@ mod tests {
     // Test: URL token is ignored when query auth is disabled
     #[tokio::test]
     async fn url_ignored_when_disabled() {
-        let (_source, address, _guard) = source_with_query_auth(
-            Some(TOKEN.to_owned().into()),
-            None,
-            None,
-            false,
-            false,
-        )
-        .await;
+        let (_source, address, _guard) =
+            source_with_query_auth(Some(TOKEN.to_owned().into()), None, None, false, false).await;
 
         let resp = reqwest::Client::new()
             .post(format!(
@@ -2578,7 +2601,9 @@ mod tests {
         .await;
 
         let resp = reqwest::Client::new()
-            .post(format!("http://{address}/services/collector/raw?channel=ch1"))
+            .post(format!(
+                "http://{address}/services/collector/raw?channel=ch1"
+            ))
             .header("Authorization", format!("Splunk {TOKEN}"))
             .body("endpoint meta raw")
             .send()
@@ -2598,8 +2623,29 @@ mod tests {
 
     #[tokio::test]
     async fn raw_endpoint_vector_namespace_root_is_string() {
-        let (source, address, _guard) = source_with_full_opts_ns(Some(TOKEN.to_owned().into()), None, None, false, false, false, Some(true)).await;
-        assert_eq!(send_req(address, "raw?channel=ch1", "raw-body-test-string", TOKEN, None, &[]).await.status(), 200);
+        let (source, address, _guard) = source_with_full_opts_ns(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            Some(true),
+        )
+        .await;
+        assert_eq!(
+            send_req(
+                address,
+                "raw?channel=ch1",
+                "raw-body-test-string",
+                TOKEN,
+                None,
+                &[]
+            )
+            .await
+            .status(),
+            200
+        );
         let log = collect_n(source, 1).await.remove(0).into_log();
         assert!(log.get(event_path!("message")).is_none());
         assert!(!log.value().is_object());
@@ -2608,12 +2654,48 @@ mod tests {
 
     #[tokio::test]
     async fn raw_endpoint_vector_namespace_metadata_preserved() {
-        let (source, address, _guard) = source_with_full_opts_ns(Some(TOKEN.to_owned().into()), None, None, false, false, false, Some(true)).await;
-        assert_eq!(send_req(address, "raw?channel=ch-test-meta", "raw-body-for-metadata", TOKEN, None, &[]).await.status(), 200);
+        let (source, address, _guard) = source_with_full_opts_ns(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            Some(true),
+        )
+        .await;
+        assert_eq!(
+            send_req(
+                address,
+                "raw?channel=ch-test-meta",
+                "raw-body-for-metadata",
+                TOKEN,
+                None,
+                &[]
+            )
+            .await
+            .status(),
+            200
+        );
         let log = collect_n(source, 1).await.remove(0).into_log();
-        assert_eq!(log.get(vrl::metadata_path!("splunk_hec_full", "endpoint")).unwrap().to_string_lossy(), "raw");
-        assert_eq!(log.get(vrl::metadata_path!("splunk_hec_full", "splunk_channel")).unwrap().to_string_lossy(), "ch-test-meta");
-        assert_eq!(log.get(vrl::metadata_path!("splunk_hec_full", "token")).unwrap().to_string_lossy(), TOKEN);
+        assert_eq!(
+            log.get(vrl::metadata_path!("splunk_hec_full", "endpoint"))
+                .unwrap()
+                .to_string_lossy(),
+            "raw"
+        );
+        assert_eq!(
+            log.get(vrl::metadata_path!("splunk_hec_full", "channel"))
+                .unwrap()
+                .to_string_lossy(),
+            "ch-test-meta"
+        );
+        assert_eq!(
+            log.get(vrl::metadata_path!("splunk_hec_full", "token"))
+                .unwrap()
+                .to_string_lossy(),
+            TOKEN
+        );
     }
 
     #[tokio::test]
@@ -2630,7 +2712,9 @@ mod tests {
         .await;
 
         let resp = reqwest::Client::new()
-            .post(format!("http://{address}/services/collector/raw?channel=ch1"))
+            .post(format!(
+                "http://{address}/services/collector/raw?channel=ch1"
+            ))
             .header("Authorization", format!("Splunk {TOKEN}"))
             .body("endpoint meta raw")
             .send()
@@ -2663,7 +2747,9 @@ mod tests {
         .await;
 
         let resp = reqwest::Client::new()
-            .post(format!("http://{address}/services/collector/event?index=foo"))
+            .post(format!(
+                "http://{address}/services/collector/event?index=foo"
+            ))
             .header("Authorization", format!("Splunk {TOKEN}"))
             .header("x-splunk-request-channel", "ch1")
             .body(r#"{"event":"auto forward default off"}"#)
@@ -2683,6 +2769,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_body_metadata_uses_vector_namespace_without_event_field_pollution() {
+        let (source, address, _guard) = source_with_full_opts_ns_auto(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            Some(true),
+            false,
+        )
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector/event"))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .header("x-splunk-request-channel", "ch1")
+            .body(
+                r#"{"event":"metadata body","host":"body-host","index":"body-index","source":"body-source","sourcetype":"body-type"}"#,
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let events = collect_n(source, 1).await;
+        let log = events[0].as_log();
+
+        assert_eq!(
+            log.get(vrl::metadata_path!("splunk_hec_full", "host"))
+                .unwrap()
+                .to_string_lossy(),
+            "body-host"
+        );
+        assert_eq!(
+            log.get(vrl::metadata_path!("splunk_hec_full", "index"))
+                .unwrap()
+                .to_string_lossy(),
+            "body-index"
+        );
+        assert_eq!(
+            log.get(vrl::metadata_path!("splunk_hec_full", "source"))
+                .unwrap()
+                .to_string_lossy(),
+            "body-source"
+        );
+        assert_eq!(
+            log.get(vrl::metadata_path!("splunk_hec_full", "sourcetype"))
+                .unwrap()
+                .to_string_lossy(),
+            "body-type"
+        );
+        assert!(log.get(event_path!("host")).is_none());
+        assert!(log.get(event_path!("index")).is_none());
+        assert!(log.get(event_path!("source")).is_none());
+        assert!(log.get(event_path!("sourcetype")).is_none());
+    }
+
+    #[tokio::test]
+    async fn raw_query_metadata_uses_vector_namespace_without_event_field_pollution() {
+        let (source, address, _guard) = source_with_full_opts_ns_auto(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            Some(true),
+            false,
+        )
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://{address}/services/collector/raw?channel=ch1&host=raw-host&index=raw-index&source=raw-source&sourcetype=raw-type"
+            ))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .body("raw metadata body")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let events = collect_n(source, 1).await;
+        let log = events[0].as_log();
+
+        assert_eq!(log.value().to_string_lossy(), "raw metadata body");
+        assert_eq!(
+            log.get(vrl::metadata_path!("splunk_hec_full", "host"))
+                .unwrap()
+                .to_string_lossy(),
+            "raw-host"
+        );
+        assert_eq!(
+            log.get(vrl::metadata_path!("splunk_hec_full", "index"))
+                .unwrap()
+                .to_string_lossy(),
+            "raw-index"
+        );
+        assert_eq!(
+            log.get(vrl::metadata_path!("splunk_hec_full", "source"))
+                .unwrap()
+                .to_string_lossy(),
+            "raw-source"
+        );
+        assert_eq!(
+            log.get(vrl::metadata_path!("splunk_hec_full", "sourcetype"))
+                .unwrap()
+                .to_string_lossy(),
+            "raw-type"
+        );
+        assert!(log.get(event_path!("host")).is_none());
+        assert!(log.get(event_path!("index")).is_none());
+        assert!(log.get(event_path!("source")).is_none());
+        assert!(log.get(event_path!("sourcetype")).is_none());
+    }
+
+    #[tokio::test]
     async fn auto_forward_metadata_enabled_injects_fields() {
         let (source, address, _guard) = source_with_full_opts_ns_auto(
             Some(TOKEN.to_owned().into()),
@@ -2697,7 +2901,9 @@ mod tests {
         .await;
 
         let resp = reqwest::Client::new()
-            .post(format!("http://{address}/services/collector/event?index=foo"))
+            .post(format!(
+                "http://{address}/services/collector/event?index=foo"
+            ))
             .header("Authorization", format!("Splunk {TOKEN}"))
             .header("x-splunk-request-channel", "ch1")
             .body(r#"{"event":"auto forward on"}"#)
@@ -2708,12 +2914,70 @@ mod tests {
 
         let events = collect_n(source, 1).await;
         let log = events[0].as_log();
-        assert_eq!(log.get(event_path!("index")).unwrap().to_string_lossy(), "foo");
+        assert_eq!(
+            log.get(event_path!("index")).unwrap().to_string_lossy(),
+            "foo"
+        );
         assert_eq!(
             log.get(vrl::metadata_path!("splunk_hec_full", "index"))
                 .unwrap()
                 .to_string_lossy(),
             "foo"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_forward_metadata_enabled_keeps_legacy_event_fields() {
+        let (source, address, _guard) = source_with_full_opts_ns_auto(
+            Some(TOKEN.to_owned().into()),
+            None,
+            None,
+            false,
+            false,
+            false,
+            Some(true),
+            true,
+        )
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector/event"))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .header("x-splunk-request-channel", "ch1")
+            .body(
+                r#"{"event":"metadata legacy","host":"legacy-host","index":"legacy-index","source":"legacy-source","sourcetype":"legacy-type"}"#,
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let events = collect_n(source, 1).await;
+        let log = events[0].as_log();
+
+        assert_eq!(
+            log.get(event_path!("host")).unwrap().to_string_lossy(),
+            "legacy-host"
+        );
+        assert_eq!(
+            log.get(event_path!("index")).unwrap().to_string_lossy(),
+            "legacy-index"
+        );
+        assert_eq!(
+            log.get(event_path!("source")).unwrap().to_string_lossy(),
+            "legacy-source"
+        );
+        assert_eq!(
+            log.get(event_path!("sourcetype"))
+                .unwrap()
+                .to_string_lossy(),
+            "legacy-type"
+        );
+        assert_eq!(
+            log.get(vrl::metadata_path!("splunk_hec_full", "index"))
+                .unwrap()
+                .to_string_lossy(),
+            "legacy-index"
         );
     }
 
@@ -3136,24 +3400,23 @@ mod tests {
 
         // URL metadata must also be present
         assert_eq!(log.get("index").unwrap().to_string_lossy(), "test_idx");
-        assert_eq!(log.get("sourcetype").unwrap().to_string_lossy(), "test_type");
+        assert_eq!(
+            log.get("sourcetype").unwrap().to_string_lossy(),
+            "test_type"
+        );
         assert_eq!(log.get("source").unwrap().to_string_lossy(), "test_src");
     }
 
     // Test: Raw endpoint without URL metadata preserves raw text body
     #[tokio::test]
     async fn test_raw_without_url_metadata_preserves_body() {
-        let (source, address, _guard) = source_with_full(
-            Some(TOKEN.to_owned().into()),
-            None,
-            None,
-            false,
-            false,
-        )
-        .await;
+        let (source, address, _guard) =
+            source_with_full(Some(TOKEN.to_owned().into()), None, None, false, false).await;
 
         let resp = reqwest::Client::new()
-            .post(format!("http://{address}/services/collector/raw?channel=ch1"))
+            .post(format!(
+                "http://{address}/services/collector/raw?channel=ch1"
+            ))
             .header("Authorization", format!("Splunk {TOKEN}"))
             .body("simple raw text")
             .send()
@@ -3184,15 +3447,7 @@ mod tests {
             Some(true),
         )
         .await;
-        let resp = send_req(
-            address,
-            "event",
-            r#"{"event":""}"#,
-            TOKEN,
-            Some("ch1"),
-            &[],
-        )
-        .await;
+        let resp = send_req(address, "event", r#"{"event":""}"#, TOKEN, Some("ch1"), &[]).await;
         assert_eq!(resp.status(), 400);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["code"], 13, "Empty string event should return code 13");
@@ -3211,15 +3466,7 @@ mod tests {
             Some(true),
         )
         .await;
-        let resp = send_req(
-            address,
-            "event",
-            r#"{"event":{}}"#,
-            TOKEN,
-            Some("ch1"),
-            &[],
-        )
-        .await;
+        let resp = send_req(address, "event", r#"{"event":{}}"#, TOKEN, Some("ch1"), &[]).await;
         assert_eq!(resp.status(), 400);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["code"], 13, "Empty object event should return code 13");
@@ -3228,16 +3475,12 @@ mod tests {
     // Test: Empty raw body rejected
     #[tokio::test]
     async fn test_empty_raw_body_rejected() {
-        let (_source, address, _guard) = source_with_full(
-            Some(TOKEN.to_owned().into()),
-            None,
-            None,
-            false,
-            false,
-        )
-        .await;
+        let (_source, address, _guard) =
+            source_with_full(Some(TOKEN.to_owned().into()), None, None, false, false).await;
         let resp = reqwest::Client::new()
-            .post(format!("http://{address}/services/collector/raw?channel=ch1"))
+            .post(format!(
+                "http://{address}/services/collector/raw?channel=ch1"
+            ))
             .header("Authorization", format!("Splunk {TOKEN}"))
             .body("")
             .send()
@@ -3260,7 +3503,11 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 200, "Basic auth (RFC 1945) should be accepted");
+        assert_eq!(
+            resp.status(),
+            200,
+            "Basic auth (RFC 1945) should be accepted"
+        );
 
         let events = collect_n(source, 1).await;
         assert_eq!(events.len(), 1);
@@ -3289,7 +3536,8 @@ mod tests {
     #[tokio::test]
     async fn test_batch_mixed_string_object_events() {
         let (source, address, _guard) = source().await;
-        let batch = r#"{"event":"string event"}{"event":{"key":"object event"}}{"event":"another string"}"#;
+        let batch =
+            r#"{"event":"string event"}{"event":{"key":"object event"}}{"event":"another string"}"#;
         let resp = send_req(address, "event", batch, TOKEN, Some("ch1"), &[]).await;
         assert_eq!(resp.status(), 200);
 
@@ -3342,8 +3590,14 @@ mod tests {
         let events = collect_n(source, 1).await;
         let log = events[0].as_log();
         // Integer should be wrapped in "message" field to prevent metadata corruption
-        let msg = log.get("message").expect("Integer event should be wrapped in 'message' field");
-        assert_eq!(msg, &Value::Integer(42), "Integer value should be preserved as 42");
+        let msg = log
+            .get("message")
+            .expect("Integer event should be wrapped in 'message' field");
+        assert_eq!(
+            msg,
+            &Value::Integer(42),
+            "Integer value should be preserved as 42"
+        );
     }
 
     // Test: Float event preserved
@@ -3372,7 +3626,9 @@ mod tests {
 
         let events = collect_n(source, 1).await;
         let log = events[0].as_log();
-        let msg = log.get("message").expect("Float event should be wrapped in 'message' field");
+        let msg = log
+            .get("message")
+            .expect("Float event should be wrapped in 'message' field");
         // Float 3.14 should be preserved
         match msg {
             Value::Float(f) => assert!((f.into_inner() - 3.14).abs() < 0.001),
@@ -3406,8 +3662,14 @@ mod tests {
 
         let events = collect_n(source, 1).await;
         let log = events[0].as_log();
-        let msg = log.get("message").expect("Boolean event should be wrapped in 'message' field");
-        assert_eq!(msg, &Value::Boolean(true), "Boolean true should be preserved");
+        let msg = log
+            .get("message")
+            .expect("Boolean event should be wrapped in 'message' field");
+        assert_eq!(
+            msg,
+            &Value::Boolean(true),
+            "Boolean true should be preserved"
+        );
     }
 
     // Test: Array event preserved
@@ -3436,7 +3698,9 @@ mod tests {
 
         let events = collect_n(source, 1).await;
         let log = events[0].as_log();
-        let msg = log.get("message").expect("Array event should be wrapped in 'message' field");
+        let msg = log
+            .get("message")
+            .expect("Array event should be wrapped in 'message' field");
         assert!(msg.is_array(), "Array value should be preserved as array");
     }
 
@@ -3498,7 +3762,8 @@ mod tests {
     #[tokio::test]
     async fn test_batch_mixed_types_with_bool_rejected_whole_batch() {
         let (source, address, _guard) = source().await;
-        let batch = r#"{"event":"string val"}{"event":42}{"event":true}{"event":{"k":"v"}}{"event":[1,2]}"#;
+        let batch =
+            r#"{"event":"string val"}{"event":42}{"event":true}{"event":{"k":"v"}}{"event":[1,2]}"#;
         let resp = send_req(address, "event", batch, TOKEN, Some("ch1"), &[]).await;
         assert_eq!(resp.status(), 400);
         let body: serde_json::Value = resp.json().await.unwrap();
@@ -3521,7 +3786,9 @@ mod tests {
         .await;
 
         let resp = reqwest::Client::new()
-            .post(format!("http://{address}/services/collector/raw?channel=ch1"))
+            .post(format!(
+                "http://{address}/services/collector/raw?channel=ch1"
+            ))
             .header("Authorization", format!("Splunk {TOKEN}"))
             .body("line_one\nline_two\nline_three")
             .send()
@@ -3530,7 +3797,11 @@ mod tests {
         assert_eq!(resp.status(), 200);
 
         let events = collect_n(source, 3).await;
-        assert_eq!(events.len(), 3, "Multiline raw body should produce 3 events");
+        assert_eq!(
+            events.len(),
+            3,
+            "Multiline raw body should produce 3 events"
+        );
 
         assert_eq!(
             events[0].as_log().get("message").unwrap().to_string_lossy(),
@@ -3587,8 +3858,14 @@ mod tests {
                 "Event {i} should have sourcetype metadata"
             );
         }
-        assert_eq!(events[0].as_log().get("message").unwrap().to_string_lossy(), "alpha");
-        assert_eq!(events[1].as_log().get("message").unwrap().to_string_lossy(), "beta");
+        assert_eq!(
+            events[0].as_log().get("message").unwrap().to_string_lossy(),
+            "alpha"
+        );
+        assert_eq!(
+            events[1].as_log().get("message").unwrap().to_string_lossy(),
+            "beta"
+        );
     }
 
     // Test: Raw line splitting disabled (default) keeps single event
@@ -3605,7 +3882,9 @@ mod tests {
         .await;
 
         let resp = reqwest::Client::new()
-            .post(format!("http://{address}/services/collector/raw?channel=ch1"))
+            .post(format!(
+                "http://{address}/services/collector/raw?channel=ch1"
+            ))
             .header("Authorization", format!("Splunk {TOKEN}"))
             .body("line_A\nline_B\nline_C")
             .send()
@@ -3614,10 +3893,17 @@ mod tests {
         assert_eq!(resp.status(), 200);
 
         let events = collect_n(source, 1).await;
-        assert_eq!(events.len(), 1, "With splitting disabled, should be 1 event");
+        assert_eq!(
+            events.len(),
+            1,
+            "With splitting disabled, should be 1 event"
+        );
         // The single event should contain all lines
         let msg = events[0].as_log().get("message").unwrap().to_string_lossy();
-        assert!(msg.contains("line_A"), "Single event should contain all text");
+        assert!(
+            msg.contains("line_A"),
+            "Single event should contain all text"
+        );
         assert!(msg.contains("line_C"));
     }
 
@@ -3667,7 +3953,9 @@ mod tests {
     async fn paths_raw() {
         let (_source, address, _guard) = source().await;
         let resp = reqwest::Client::new()
-            .post(format!("http://{address}/services/collector/raw?channel=ch1"))
+            .post(format!(
+                "http://{address}/services/collector/raw?channel=ch1"
+            ))
             .header("Authorization", format!("Splunk {TOKEN}"))
             .body("alias raw")
             .send()
@@ -3680,7 +3968,9 @@ mod tests {
     async fn paths_raw_1_0() {
         let (_source, address, _guard) = source().await;
         let resp = reqwest::Client::new()
-            .post(format!("http://{address}/services/collector/raw/1.0?channel=ch1"))
+            .post(format!(
+                "http://{address}/services/collector/raw/1.0?channel=ch1"
+            ))
             .header("Authorization", format!("Splunk {TOKEN}"))
             .body("alias raw 1.0")
             .send()
