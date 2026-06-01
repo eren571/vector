@@ -13,7 +13,7 @@ use bytes::{Buf, Bytes};
 use chrono::{DateTime, TimeZone, Utc};
 use flate2::read::MultiGzDecoder;
 use futures::FutureExt;
-use http::StatusCode;
+use http::{HeaderMap, Method, StatusCode};
 use hyper::{Server, service::make_service_fn};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{
@@ -180,6 +180,32 @@ pub struct SplunkHecFullConfig {
     /// When disabled (default), the entire raw body is treated as a single event.
     #[serde(default)]
     raw_line_splitting: bool,
+
+    /// Controls diagnostic logs emitted when a HEC request is rejected before
+    /// events enter the Vector topology.
+    #[configurable(derived)]
+    #[serde(default)]
+    bad_request_diagnostics: BadRequestDiagnosticsConfig,
+}
+
+/// Diagnostic logging options for rejected HEC requests.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default)]
+#[serde(deny_unknown_fields, default)]
+struct BadRequestDiagnosticsConfig {
+    /// Whether to emit a diagnostic log for rejected requests.
+    enabled: bool,
+
+    /// Whether to include headers and body in diagnostic logs.
+    ///
+    /// The HEC token is logged in plaintext whenever diagnostics are enabled.
+    include_full_request: bool,
+}
+
+impl BadRequestDiagnosticsConfig {
+    const fn include_full_request(self) -> bool {
+        self.enabled && self.include_full_request
+    }
 }
 
 const fn default_true() -> bool {
@@ -208,6 +234,7 @@ impl Default for SplunkHecFullConfig {
             fix_bare_string_events: true,
             raw_require_channel: false,
             raw_line_splitting: false,
+            bad_request_diagnostics: Default::default(),
         }
     }
 }
@@ -421,6 +448,7 @@ struct SplunkSource {
     fix_bare_string_events: bool,
     raw_require_channel: bool,
     raw_line_splitting: bool,
+    bad_request_diagnostics: BadRequestDiagnosticsConfig,
 }
 
 impl SplunkSource {
@@ -459,6 +487,7 @@ impl SplunkSource {
             fix_bare_string_events: config.fix_bare_string_events,
             raw_require_channel: config.raw_require_channel,
             raw_line_splitting: config.raw_line_splitting,
+            bad_request_diagnostics: config.bad_request_diagnostics,
         })
     }
 
@@ -484,6 +513,9 @@ impl SplunkSource {
         let events_received = self.events_received.clone();
         let auto_forward_metadata = self.auto_forward_metadata;
         let fix_bare_string_events = self.fix_bare_string_events;
+        let bad_request_diagnostics = self.bad_request_diagnostics;
+        let diagnostic_query = Self::bad_request_diagnostic_query(bad_request_diagnostics);
+        let diagnostic_headers = Self::bad_request_diagnostic_headers(bad_request_diagnostics);
 
         warp::post()
             .and(
@@ -496,6 +528,9 @@ impl SplunkSource {
             .and(warp::addr::remote())
             .and(warp::header::optional::<String>("X-Forwarded-For"))
             .and(self.gzip())
+            .and(warp::method())
+            .and(diagnostic_query)
+            .and(diagnostic_headers)
             .and(warp::body::bytes())
             .and(warp::path::full())
             .and_then(
@@ -509,14 +544,37 @@ impl SplunkSource {
                       remote: Option<SocketAddr>,
                       remote_addr: Option<String>,
                       gzip: bool,
+                      method: Method,
+                      query: Option<String>,
+                      headers: HeaderMap,
                       body: Bytes,
                       path: warp::path::FullPath| {
                     let mut out = out.clone();
                     let idx_ack = idx_ack.clone();
                     let events_received = events_received.clone();
+                    let path = path.as_str().to_owned();
 
                     async move {
+                        let diagnostic_context = BadRequestDiagnosticContext {
+                            config: bad_request_diagnostics,
+                            hec_token: token.as_deref(),
+                            endpoint: "event",
+                            method: &method,
+                            path: &path,
+                            query: query.as_deref(),
+                            headers: &headers,
+                            remote_addr: remote,
+                            x_forwarded_for: remote_addr.as_deref(),
+                            gzip,
+                        };
+
                         if idx_ack.is_some() && channel.is_none() {
+                            diagnostic_context.emit(
+                                ApiError::MissingChannel,
+                                channel.as_deref(),
+                                body.len(),
+                                None,
+                            );
                             return Err(Rejection::from(ApiError::MissingChannel));
                         }
 
@@ -528,9 +586,18 @@ impl SplunkSource {
 
                         let mut data = Vec::new();
                         let (byte_size, body) = if gzip {
-                            MultiGzDecoder::new(body.reader())
+                            if MultiGzDecoder::new(body.reader())
                                 .read_to_end(&mut data)
-                                .map_err(|_| Rejection::from(ApiError::BadRequest))?;
+                                .is_err()
+                            {
+                                diagnostic_context.emit(
+                                    ApiError::BadRequest,
+                                    channel.as_deref(),
+                                    0,
+                                    None,
+                                );
+                                return Err(Rejection::from(ApiError::BadRequest));
+                            }
                             (data.len(), String::from_utf8_lossy(data.as_slice()))
                         } else {
                             (body.len(), String::from_utf8_lossy(body.as_ref()))
@@ -547,7 +614,17 @@ impl SplunkSource {
                             (Some(idx_ack), Some(receiver), Some(channel_id)) => {
                                 match idx_ack.get_ack_id_from_channel(channel_id, receiver).await {
                                     Ok(ack_id) => Some(ack_id),
-                                    Err(rej) => return Err(rej),
+                                    Err(rej) => {
+                                        if let Some(&error) = rej.find::<ApiError>() {
+                                            diagnostic_context.emit(
+                                                error,
+                                                channel.as_deref(),
+                                                byte_size,
+                                                Some(&body),
+                                            );
+                                        }
+                                        return Err(rej);
+                                    }
                                 }
                             }
                             _ => None,
@@ -555,15 +632,16 @@ impl SplunkSource {
 
                         let mut error = None;
                         let mut events = Vec::new();
+                        let channel_for_diagnostic = channel.clone();
 
                         let iter: EventIterator<'_, StrRead<'_>> = EventIteratorGenerator {
                             deserializer: Deserializer::from_str(&body).into_iter::<JsonValue>(),
                             channel,
                             query_index: query_index_for_events.clone(),
                             remote,
-                            remote_addr,
+                            remote_addr: remote_addr.clone(),
                             batch,
-                            token: token.map(Into::into),
+                            token: token.clone().map(Into::into),
                             store_hec_token,
                             log_namespace,
                             events_received,
@@ -609,6 +687,14 @@ impl SplunkSource {
                         }
 
                         if let Some(error) = error {
+                            if let Some(&api_error) = error.find::<ApiError>() {
+                                diagnostic_context.emit(
+                                    api_error,
+                                    channel_for_diagnostic.as_deref(),
+                                    byte_size,
+                                    Some(&body),
+                                );
+                            }
                             Err(error)
                         } else {
                             Ok(maybe_ack_id)
@@ -630,6 +716,9 @@ impl SplunkSource {
         let fix_bare_string_events = self.fix_bare_string_events;
         let raw_require_channel = self.raw_require_channel;
         let raw_line_splitting = self.raw_line_splitting;
+        let bad_request_diagnostics = self.bad_request_diagnostics;
+        let diagnostic_query = Self::bad_request_diagnostic_query(bad_request_diagnostics);
+        let diagnostic_headers = Self::bad_request_diagnostic_headers(bad_request_diagnostics);
 
         warp::post()
             .and(path!("raw" / "1.0").or(path!("raw")))
@@ -641,6 +730,9 @@ impl SplunkSource {
             .and(warp::addr::remote())
             .and(warp::header::optional::<String>("X-Forwarded-For"))
             .and(self.gzip())
+            .and(warp::method())
+            .and(diagnostic_query)
+            .and(diagnostic_headers)
             .and(warp::body::bytes())
             .and(warp::path::full())
             .and_then(
@@ -651,11 +743,16 @@ impl SplunkSource {
                       remote: Option<SocketAddr>,
                       xff: Option<String>,
                       gzip: bool,
+                      method: Method,
+                      query: Option<String>,
+                      headers: HeaderMap,
                       body: Bytes,
                       path: warp::path::FullPath| {
                     let mut out = out.clone();
                     let idx_ack = idx_ack.clone();
                     let events_received = events_received.clone();
+                    let path = path.as_str().to_owned();
+                    let body_for_diagnostic = diagnostic_body(&body, gzip, bad_request_diagnostics);
 
                     emit!(HttpBytesReceived {
                         byte_size: body.len(),
@@ -664,6 +761,19 @@ impl SplunkSource {
                     });
 
                     async move {
+                        let diagnostic_context = BadRequestDiagnosticContext {
+                            config: bad_request_diagnostics,
+                            hec_token: token.as_deref(),
+                            endpoint: "raw",
+                            method: &method,
+                            path: &path,
+                            query: query.as_deref(),
+                            headers: &headers,
+                            remote_addr: remote,
+                            x_forwarded_for: xff.as_deref(),
+                            gzip,
+                        };
+
                         // Channel: header takes priority over query param
                         let channel_id = channel_header.or(query_params.channel);
 
@@ -672,6 +782,12 @@ impl SplunkSource {
                             Some(ch) => ch,
                             None => {
                                 if raw_require_channel {
+                                    diagnostic_context.emit(
+                                        ApiError::MissingChannel,
+                                        None,
+                                        body.len(),
+                                        body_for_diagnostic.as_deref(),
+                                    );
                                     return Err(Rejection::from(ApiError::MissingChannel));
                                 }
                                 // Auto-generate a channel ID for events without one
@@ -685,38 +801,60 @@ impl SplunkSource {
                             (Some(idx_ack), Some(receiver)) => Some(
                                 idx_ack
                                     .get_ack_id_from_channel(channel_id.clone(), receiver)
-                                    .await?,
+                                    .await
+                                    .inspect_err(|rej| {
+                                        if let Some(&error) = rej.find::<ApiError>() {
+                                            diagnostic_context.emit(
+                                                error,
+                                                Some(channel_id.as_str()),
+                                                body.len(),
+                                                body_for_diagnostic.as_deref(),
+                                            );
+                                        }
+                                    })?,
                             ),
                             _ => None,
                         };
 
                         // Build raw event(s)
                         // When raw_line_splitting is enabled, split body by newlines into multiple events
-                        let mut events = if raw_line_splitting {
+                        let events_result = if raw_line_splitting {
                             raw_events_split(
-                                body,
+                                body.clone(),
                                 gzip,
-                                channel_id,
+                                channel_id.clone(),
                                 remote,
-                                xff,
+                                xff.clone(),
                                 batch,
                                 log_namespace,
                                 &events_received,
                                 fix_bare_string_events,
-                            )?
+                            )
                         } else {
-                            vec![raw_event(
-                                body,
+                            raw_event(
+                                body.clone(),
                                 gzip,
-                                channel_id,
+                                channel_id.clone(),
                                 remote,
-                                xff,
+                                xff.clone(),
                                 batch,
                                 log_namespace,
                                 &events_received,
                                 fix_bare_string_events,
-                            )?]
+                            )
+                            .map(|event| vec![event])
                         };
+
+                        let mut events = events_result.inspect_err(|rej| {
+                            if let Some(&error) = rej.find::<ApiError>() {
+                                diagnostic_context.emit(
+                                    error,
+                                    Some(channel_id.as_str()),
+                                    body.len(),
+                                    body_for_diagnostic.as_deref(),
+                                );
+                            }
+                        })?;
 
                         // Compute final metadata values (shared across all events)
                         let final_host = query_params.host;
@@ -878,6 +1016,32 @@ impl SplunkSource {
                     Ok(value)
                 },
             )
+    }
+
+    fn optional_raw_query() -> impl Filter<Extract = (Option<String>,), Error = Rejection> + Clone {
+        warp::query::raw()
+            .map(Some)
+            .or_else(|_| async { Ok::<(Option<String>,), Rejection>((None,)) })
+    }
+
+    fn bad_request_diagnostic_query(
+        config: BadRequestDiagnosticsConfig,
+    ) -> BoxedFilter<(Option<String>,)> {
+        if config.include_full_request() {
+            Self::optional_raw_query().boxed()
+        } else {
+            warp::any().map(|| None).boxed()
+        }
+    }
+
+    fn bad_request_diagnostic_headers(
+        config: BadRequestDiagnosticsConfig,
+    ) -> BoxedFilter<(HeaderMap,)> {
+        if config.include_full_request() {
+            warp::header::headers_cloned().boxed()
+        } else {
+            warp::any().map(HeaderMap::new).boxed()
+        }
     }
 
     fn ack_service(&self) -> BoxedFilter<(Response,)> {
@@ -1867,6 +2031,125 @@ pub(crate) enum ApiError {
 
 impl warp::reject::Reject for ApiError {}
 
+struct BadRequestDiagnosticContext<'a> {
+    config: BadRequestDiagnosticsConfig,
+    hec_token: Option<&'a str>,
+    endpoint: &'static str,
+    method: &'a Method,
+    path: &'a str,
+    query: Option<&'a str>,
+    headers: &'a HeaderMap,
+    remote_addr: Option<SocketAddr>,
+    x_forwarded_for: Option<&'a str>,
+    gzip: bool,
+}
+
+impl BadRequestDiagnosticContext<'_> {
+    fn emit(
+        &self,
+        error: ApiError,
+        channel: Option<&str>,
+        body_size_bytes: usize,
+        body: Option<&str>,
+    ) {
+        emit_bad_request_diagnostic(BadRequestDiagnostic {
+            config: self.config,
+            error,
+            hec_token: self.hec_token,
+            endpoint: self.endpoint,
+            method: self.method,
+            path: self.path,
+            query: self.query,
+            headers: self.headers,
+            body,
+            remote_addr: self.remote_addr,
+            x_forwarded_for: self.x_forwarded_for,
+            channel,
+            body_size_bytes,
+            gzip: self.gzip,
+        });
+    }
+}
+
+struct BadRequestDiagnostic<'a> {
+    config: BadRequestDiagnosticsConfig,
+    error: ApiError,
+    hec_token: Option<&'a str>,
+    endpoint: &'static str,
+    method: &'a Method,
+    path: &'a str,
+    query: Option<&'a str>,
+    headers: &'a HeaderMap,
+    body: Option<&'a str>,
+    remote_addr: Option<SocketAddr>,
+    x_forwarded_for: Option<&'a str>,
+    channel: Option<&'a str>,
+    body_size_bytes: usize,
+    gzip: bool,
+}
+
+fn emit_bad_request_diagnostic(context: BadRequestDiagnostic<'_>) {
+    if !context.config.enabled {
+        return;
+    }
+
+    let remote_addr = context.remote_addr.map(|addr| addr.to_string());
+
+    if context.config.include_full_request {
+        error!(
+            message = "Bad Splunk HEC request diagnostic.",
+            error = ?context.error,
+            hec_token = context.hec_token.unwrap_or(""),
+            endpoint = context.endpoint,
+            path = context.path,
+            method = context.method.as_str(),
+            query = context.query.unwrap_or(""),
+            headers = ?context.headers,
+            body = context.body.unwrap_or(""),
+            remote_addr = remote_addr.as_deref().unwrap_or(""),
+            x_forwarded_for = context.x_forwarded_for.unwrap_or(""),
+            channel = context.channel.unwrap_or(""),
+            body_size_bytes = context.body_size_bytes,
+            gzip = context.gzip,
+            internal_log_rate_limit = false,
+        );
+    } else {
+        error!(
+            message = "Bad Splunk HEC request diagnostic.",
+            error = ?context.error,
+            hec_token = context.hec_token.unwrap_or(""),
+            endpoint = context.endpoint,
+            path = context.path,
+            remote_addr = remote_addr.as_deref().unwrap_or(""),
+            x_forwarded_for = context.x_forwarded_for.unwrap_or(""),
+            channel = context.channel.unwrap_or(""),
+            body_size_bytes = context.body_size_bytes,
+            gzip = context.gzip,
+            internal_log_rate_limit = false,
+        );
+    }
+}
+
+fn diagnostic_body(
+    body: &Bytes,
+    gzip: bool,
+    config: BadRequestDiagnosticsConfig,
+) -> Option<String> {
+    if !config.include_full_request() {
+        return None;
+    }
+
+    if gzip {
+        let mut data = Vec::new();
+        match MultiGzDecoder::new(body.clone().reader()).read_to_end(&mut data) {
+            Ok(_) => Some(String::from_utf8_lossy(data.as_slice()).into_owned()),
+            Err(error) => Some(format!("<failed to decode gzip request body: {error}>")),
+        }
+    } else {
+        Some(String::from_utf8_lossy(body.as_ref()).into_owned())
+    }
+}
+
 /// Cached bodies for common responses
 mod splunk_response {
     use serde::Serialize;
@@ -2093,6 +2376,7 @@ mod tests {
                 fix_bare_string_events: true,
                 raw_require_channel: true,
                 raw_line_splitting: false,
+                bad_request_diagnostics: Default::default(),
             }
             .build(cx)
             .await
@@ -2106,6 +2390,44 @@ mod tests {
 
     async fn source() -> (impl Stream<Item = Event> + Unpin, SocketAddr, PortGuard) {
         source_with(Some(TOKEN.to_owned().into()), None, None, false).await
+    }
+
+    async fn source_with_bad_request_diagnostics(
+        bad_request_diagnostics: BadRequestDiagnosticsConfig,
+        raw_require_channel: bool,
+    ) -> (
+        impl Stream<Item = Event> + Unpin + use<>,
+        SocketAddr,
+        PortGuard,
+    ) {
+        let (sender, recv) = SourceSender::new_test_finalize(EventStatus::Delivered);
+        let (_guard, address) = next_addr();
+        let cx = SourceContext::new_test(sender, None);
+        tokio::spawn(async move {
+            SplunkHecFullConfig {
+                address,
+                token: Some(TOKEN.to_owned().into()),
+                valid_tokens: None,
+                tls: None,
+                acknowledgements: Default::default(),
+                store_hec_token: false,
+                log_namespace: Some(true),
+                keepalive: Default::default(),
+                allow_query_string_auth: true,
+                auto_forward_metadata: true,
+                fix_bare_string_events: true,
+                raw_require_channel,
+                raw_line_splitting: false,
+                bad_request_diagnostics,
+            }
+            .build(cx)
+            .await
+            .unwrap()
+            .await
+            .unwrap()
+        });
+        wait_for_tcp(address).await;
+        (recv, address, _guard)
     }
 
     async fn source_with_full(
@@ -2215,6 +2537,7 @@ mod tests {
                 fix_bare_string_events: true,
                 raw_require_channel,
                 raw_line_splitting,
+                bad_request_diagnostics: Default::default(),
             }
             .build(cx)
             .await
@@ -3002,6 +3325,7 @@ mod tests {
                 fix_bare_string_events: true,
                 raw_require_channel: true,
                 raw_line_splitting: false,
+                bad_request_diagnostics: Default::default(),
             }
             .build(cx)
             .await
@@ -3470,6 +3794,98 @@ mod tests {
         assert_eq!(resp.status(), 400);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["code"], 13, "Empty object event should return code 13");
+    }
+
+    #[test]
+    fn bad_request_diagnostics_defaults_to_context_only_disabled() {
+        let config = BadRequestDiagnosticsConfig::default();
+
+        assert!(!config.enabled);
+        assert!(!config.include_full_request);
+        assert!(!config.include_full_request());
+    }
+
+    #[test]
+    fn diagnostic_body_only_available_for_full_request_mode() {
+        let body = Bytes::from_static(br#"{"event":""}"#);
+
+        assert_eq!(
+            diagnostic_body(
+                &body,
+                false,
+                BadRequestDiagnosticsConfig {
+                    enabled: true,
+                    include_full_request: false,
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            diagnostic_body(
+                &body,
+                false,
+                BadRequestDiagnosticsConfig {
+                    enabled: true,
+                    include_full_request: true,
+                }
+            ),
+            Some(r#"{"event":""}"#.to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_request_diagnostics_enabled_preserves_empty_event_response() {
+        let (_source, address, _guard) = source_with_bad_request_diagnostics(
+            BadRequestDiagnosticsConfig {
+                enabled: true,
+                include_full_request: false,
+            },
+            false,
+        )
+        .await;
+        let resp = send_req(address, "event", r#"{"event":""}"#, TOKEN, Some("ch1"), &[]).await;
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], 13);
+    }
+
+    #[tokio::test]
+    async fn bad_request_diagnostics_full_request_preserves_empty_event_response() {
+        let (_source, address, _guard) = source_with_bad_request_diagnostics(
+            BadRequestDiagnosticsConfig {
+                enabled: true,
+                include_full_request: true,
+            },
+            false,
+        )
+        .await;
+        let resp = send_req(address, "event", r#"{"event":""}"#, TOKEN, Some("ch1"), &[]).await;
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], 13);
+    }
+
+    #[tokio::test]
+    async fn raw_bad_request_diagnostics_preserves_rejection_response() {
+        let (_source, address, _guard) = source_with_bad_request_diagnostics(
+            BadRequestDiagnosticsConfig {
+                enabled: true,
+                include_full_request: false,
+            },
+            true,
+        )
+        .await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://{address}/services/collector/raw"))
+            .header("Authorization", format!("Splunk {TOKEN}"))
+            .body("raw data without channel")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], 10);
     }
 
     // Test: Empty raw body rejected
