@@ -1,0 +1,145 @@
+name: Build Vector Custom RPM
+
+on:
+  push:
+    branches: [prod-v0.57.0]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DISABLE_MOLD: true
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  CARGO_BUILD_JOBS: 3
+  VECTOR_VERSION: 0.57.0
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    container:
+      image: amazonlinux:2023
+
+    steps:
+      - name: Install checkout dependencies
+        run: dnf install -y git tar gzip
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          dnf install -y \
+            gcc \
+            gcc-c++ \
+            make \
+            cmake \
+            openssl-devel \
+            pkgconf-pkg-config \
+            cyrus-sasl-devel \
+            libzstd-devel \
+            clang-devel \
+            perl-core \
+            ruby \
+            ruby-devel \
+            rubygems \
+            rpm-build \
+            rpm \
+            unzip
+          curl --version
+          gem install --no-document fpm
+
+      - name: Install protoc
+        run: |
+          PROTOC_VERSION="25.3"
+          curl -Lo /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          chmod +x /usr/local/bin/protoc
+          protoc --version
+
+      - name: Install Rust 1.95
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain 1.95 --target x86_64-unknown-linux-gnu
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+
+      - name: Test splunk_hec_full
+        run: |
+          cargo test --locked \
+            --no-default-features \
+            --features sources-splunk_hec_full \
+            --lib sources::splunk_hec_full
+
+      - name: Build release binary
+        run: |
+          cargo build --locked --release \
+            --target x86_64-unknown-linux-gnu \
+            --no-default-features \
+            --features target-x86_64-unknown-linux-gnu
+
+      - name: Verify compiled component
+        run: |
+          VECTOR_BIN=target/x86_64-unknown-linux-gnu/release/vector
+          "$VECTOR_BIN" --version | grep -F "vector ${VECTOR_VERSION}"
+          "$VECTOR_BIN" list | grep -q '^- splunk_hec_full$'
+
+      - name: Package RPM
+        run: |
+          mkdir -p target/package/usr/bin target/package/etc/vector
+          cp target/x86_64-unknown-linux-gnu/release/vector target/package/usr/bin/
+          cp config/vector.yaml target/package/etc/vector/vector.yaml.example
+
+          fpm -s dir -t rpm \
+            -n "vector-custom" \
+            -v "${VECTOR_VERSION}" \
+            --iteration "1" \
+            --architecture x86_64 \
+            --depends "cyrus-sasl-lib" \
+            --description "Vector ${VECTOR_VERSION} with the splunk_hec_full source" \
+            -C target/package .
+
+          rpm -qip ./vector-custom-*.rpm
+          rpm -qlp ./vector-custom-*.rpm
+          rpm -qpR ./vector-custom-*.rpm
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector-custom-${{ env.VECTOR_VERSION }}-rpm
+          path: ./*.rpm
+          if-no-files-found: error
+
+  verify-rpm:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        container:
+          - amazonlinux:2023
+          - quay.io/centos/centos:stream9
+    container:
+      image: ${{ matrix.container }}
+
+    steps:
+      - name: Download RPM
+        uses: actions/download-artifact@v4
+        with:
+          name: vector-custom-${{ env.VECTOR_VERSION }}-rpm
+          path: ./
+
+      - name: Install and verify RPM
+        run: |
+          yum install -y ./vector-custom-*.rpm
+          ldd /usr/bin/vector
+          if ldd /usr/bin/vector | grep -q "not found"; then
+            exit 1
+          fi
+          vector --version | grep -F "vector ${VECTOR_VERSION}"
+          vector list | grep -q '^- splunk_hec_full$'
+          vector help >/dev/null

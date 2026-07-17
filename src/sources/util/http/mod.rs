@@ -21,6 +21,7 @@ mod query;
     feature = "sources-datadog_agent",
     feature = "sources-opentelemetry",
     feature = "sources-splunk_hec",
+    feature = "sources-splunk_hec_full",
     all(test, feature = "sources-http_client"),
 ))]
 pub(crate) use encoding::capped_body;
